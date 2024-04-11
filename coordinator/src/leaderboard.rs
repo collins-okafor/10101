@@ -158,6 +158,7 @@ pub mod tests {
     use crate::position::models::Position;
     use crate::position::models::PositionState;
     use bitcoin::secp256k1::PublicKey;
+    use bitcoin::Amount;
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
     use std::str::FromStr;
@@ -257,6 +258,7 @@ pub mod tests {
             trader_direction: Direction::Long,
             average_entry_price: 0.0,
             trader_liquidation_price: 0.0,
+            coordinator_liquidation_price: 0.0,
             position_state: PositionState::Closed { pnl: 0 },
             coordinator_margin: 0,
             creation_timestamp: OffsetDateTime::now_utc(),
@@ -269,6 +271,7 @@ pub mod tests {
             trader_margin: 0,
             stable: false,
             trader_realized_pnl_sat: Some(pnl),
+            order_matching_fees: Amount::ZERO,
         }
     }
 

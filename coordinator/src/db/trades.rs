@@ -17,7 +17,6 @@ struct Trade {
     trader_pubkey: String,
     quantity: f32,
     trader_leverage: f32,
-    collateral: i64,
     direction: Direction,
     average_price: f32,
     timestamp: OffsetDateTime,
@@ -33,7 +32,6 @@ struct NewTrade {
     trader_pubkey: String,
     quantity: f32,
     trader_leverage: f32,
-    collateral: i64,
     direction: Direction,
     average_price: f32,
     order_matching_fee_sat: i64,
@@ -64,6 +62,22 @@ pub fn get_latest_for_position(
     Ok(trade.map(crate::trade::models::Trade::from))
 }
 
+pub fn get_trades(
+    connection: &mut PgConnection,
+    trader_pubkey: PublicKey,
+) -> Result<Vec<crate::trade::models::Trade>> {
+    let trades: Vec<Trade> = trades::table
+        .filter(trades::trader_pubkey.eq(trader_pubkey.to_string()))
+        .load::<Trade>(connection)?;
+
+    let trades = trades
+        .into_iter()
+        .map(crate::trade::models::Trade::from)
+        .collect();
+
+    Ok(trades)
+}
+
 impl From<crate::trade::models::NewTrade> for NewTrade {
     fn from(value: crate::trade::models::NewTrade) -> Self {
         NewTrade {
@@ -72,7 +86,6 @@ impl From<crate::trade::models::NewTrade> for NewTrade {
             trader_pubkey: value.trader_pubkey.to_string(),
             quantity: value.quantity,
             trader_leverage: value.trader_leverage,
-            collateral: value.coordinator_margin,
             direction: value.trader_direction.into(),
             average_price: value.average_price,
             order_matching_fee_sat: value.order_matching_fee.to_sat() as i64,
@@ -91,7 +104,6 @@ impl From<Trade> for crate::trade::models::Trade {
                 .expect("public key to decode"),
             quantity: value.quantity,
             trader_leverage: value.trader_leverage,
-            collateral: value.collateral,
             direction: value.direction.into(),
             average_price: value.average_price,
             timestamp: value.timestamp,

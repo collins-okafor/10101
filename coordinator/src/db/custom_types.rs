@@ -1,3 +1,4 @@
+use crate::db::bonus_status::BonusType;
 use crate::db::dlc_channels::DlcChannelState;
 use crate::db::dlc_messages::MessageType;
 use crate::db::dlc_protocols::DlcProtocolState;
@@ -5,6 +6,7 @@ use crate::db::dlc_protocols::DlcProtocolType;
 use crate::db::polls::PollType;
 use crate::db::positions::ContractSymbol;
 use crate::db::positions::PositionState;
+use crate::schema::sql_types::BonusStatusType;
 use crate::schema::sql_types::ContractSymbolType;
 use crate::schema::sql_types::DirectionType;
 use crate::schema::sql_types::DlcChannelStateType;
@@ -52,7 +54,6 @@ impl ToSql<PositionStateType, Pg> for PositionState {
             PositionState::Resizing => out.write_all(b"Resizing")?,
             PositionState::Proposed => out.write_all(b"Proposed")?,
             PositionState::Failed => out.write_all(b"Failed")?,
-            PositionState::ResizeProposed => out.write_all(b"ResizeProposed")?,
         }
         Ok(IsNull::No)
     }
@@ -68,7 +69,6 @@ impl FromSql<PositionStateType, Pg> for PositionState {
             b"Resizing" => Ok(PositionState::Resizing),
             b"Proposed" => Ok(PositionState::Proposed),
             b"Failed" => Ok(PositionState::Failed),
-            b"ResizeProposed" => Ok(PositionState::ResizeProposed),
             _ => Err("Unrecognized enum variant".into()),
         }
     }
@@ -181,12 +181,13 @@ impl FromSql<ProtocolStateType, Pg> for DlcProtocolState {
 impl ToSql<ProtocolTypeType, Pg> for DlcProtocolType {
     fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
         match *self {
-            DlcProtocolType::Open => out.write_all(b"open")?,
+            DlcProtocolType::OpenChannel => out.write_all(b"open-channel")?,
             DlcProtocolType::Settle => out.write_all(b"settle")?,
-            DlcProtocolType::Renew => out.write_all(b"renew")?,
+            DlcProtocolType::OpenPosition => out.write_all(b"open-position")?,
             DlcProtocolType::Rollover => out.write_all(b"rollover")?,
             DlcProtocolType::Close => out.write_all(b"close")?,
             DlcProtocolType::ForceClose => out.write_all(b"force-close")?,
+            DlcProtocolType::ResizePosition => out.write_all(b"resize-position")?,
         }
         Ok(IsNull::No)
     }
@@ -195,12 +196,13 @@ impl ToSql<ProtocolTypeType, Pg> for DlcProtocolType {
 impl FromSql<ProtocolTypeType, Pg> for DlcProtocolType {
     fn from_sql(bytes: PgValue<'_>) -> deserialize::Result<Self> {
         match bytes.as_bytes() {
-            b"open" => Ok(DlcProtocolType::Open),
+            b"open-channel" => Ok(DlcProtocolType::OpenChannel),
             b"settle" => Ok(DlcProtocolType::Settle),
-            b"renew" => Ok(DlcProtocolType::Renew),
+            b"open-position" => Ok(DlcProtocolType::OpenPosition),
             b"rollover" => Ok(DlcProtocolType::Rollover),
             b"close" => Ok(DlcProtocolType::Close),
             b"force-close" => Ok(DlcProtocolType::ForceClose),
+            b"resize-position" => Ok(DlcProtocolType::ResizePosition),
             _ => Err("Unrecognized enum variant for ProtocolTypeType".into()),
         }
     }
@@ -229,6 +231,26 @@ impl FromSql<DlcChannelStateType, Pg> for DlcChannelState {
             b"Closed" => Ok(DlcChannelState::Closed),
             b"Failed" => Ok(DlcChannelState::Failed),
             b"Cancelled" => Ok(DlcChannelState::Cancelled),
+            _ => Err("Unrecognized enum variant".into()),
+        }
+    }
+}
+
+impl ToSql<BonusStatusType, Pg> for BonusType {
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
+        match *self {
+            BonusType::Referral => out.write_all(b"Referral")?,
+            BonusType::Referent => out.write_all(b"Referent")?,
+        }
+        Ok(IsNull::No)
+    }
+}
+
+impl FromSql<BonusStatusType, Pg> for BonusType {
+    fn from_sql(bytes: PgValue<'_>) -> deserialize::Result<Self> {
+        match bytes.as_bytes() {
+            b"Referral" => Ok(BonusType::Referral),
+            b"Referent" => Ok(BonusType::Referent),
             _ => Err("Unrecognized enum variant".into()),
         }
     }

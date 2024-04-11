@@ -12,9 +12,12 @@ use crate::dlc::dlc_handler;
 use crate::dlc::dlc_handler::DlcHandler;
 use crate::event;
 use crate::event::EventInternal;
+use crate::health::Tx;
 use crate::ln_dlc::node::Node;
 use crate::ln_dlc::node::NodeStorage;
 use crate::ln_dlc::node::WalletHistory;
+use crate::orderbook;
+use crate::position::ForceCloseDlcChannelSubscriber;
 use crate::state;
 use crate::storage::TenTenOneNodeStorage;
 use crate::trade::order;
@@ -41,6 +44,7 @@ use bitcoin::Address;
 use bitcoin::Amount;
 use bitcoin::Txid;
 use commons::CollaborativeRevertTraderResponse;
+use commons::OrderbookRequest;
 use dlc::PartyParams;
 use dlc_manager::channel::Channel as DlcChannel;
 use itertools::chain;
@@ -72,6 +76,7 @@ use ln_dlc_node::ConfirmationStatus;
 use ln_dlc_storage::DlcChannelEvent;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
@@ -85,9 +90,9 @@ use std::time::SystemTime;
 use time::OffsetDateTime;
 use tokio::runtime;
 use tokio::runtime::Runtime;
+use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio::task::spawn_blocking;
-use trade::ContractSymbol;
 use uuid::Uuid;
 
 pub mod node;
@@ -166,6 +171,30 @@ pub async fn full_sync(stop_gap: usize) -> Result<()> {
 
 pub fn get_seed_phrase() -> Vec<String> {
     state::get_seed().get_seed_phrase()
+}
+
+pub fn get_maintenance_margin_rate() -> Decimal {
+    match state::try_get_tentenone_config() {
+        Some(config) => {
+            Decimal::try_from(config.maintenance_margin_rate).expect("to fit into decimal")
+        }
+        None => {
+            tracing::warn!("The ten ten one config is not ready yet. Returning default value!");
+            dec!(0.1)
+        }
+    }
+}
+
+pub fn get_order_matching_fee_rate() -> Decimal {
+    match state::try_get_tentenone_config() {
+        Some(config) => {
+            let fee_percent =
+                Decimal::try_from(config.order_matching_fee_rate).expect("to fit into decimal");
+            let fee_discount = config.referral_status.referral_fee_bonus;
+            fee_percent - (fee_percent * fee_discount)
+        }
+        None => dec!(0.003),
+    }
 }
 
 /// Gets the seed from the storage or from disk. However it will panic if the seed can not be found.
@@ -262,14 +291,17 @@ pub fn get_storage() -> TenTenOneNodeStorage {
 /// Start the node
 ///
 /// Assumes that the seed has already been initialized
-pub fn run(runtime: &Runtime) -> Result<()> {
+pub fn run(
+    runtime: &Runtime,
+    tx: Tx,
+    fcm_token: String,
+    tx_websocket: broadcast::Sender<OrderbookRequest>,
+) -> Result<()> {
     runtime.block_on(async move {
         event::publish(&EventInternal::Init("Starting full ldk node".to_string()));
 
         let mut ephemeral_randomness = [0; 32];
         thread_rng().fill_bytes(&mut ephemeral_randomness);
-
-        // TODO: Subscribe to events from the orderbook and publish OrderFilledWith event
 
         let address = {
             let listener = TcpListener::bind("0.0.0.0:0")?;
@@ -283,6 +315,7 @@ pub fn run(runtime: &Runtime) -> Result<()> {
         let storage = get_storage();
 
         event::subscribe(DBBackupSubscriber::new(storage.clone().client));
+        event::subscribe(ForceCloseDlcChannelSubscriber);
 
         let node_event_handler = Arc::new(NodeEventHandler::new());
 
@@ -318,6 +351,14 @@ pub fn run(runtime: &Runtime) -> Result<()> {
 
         let node = Arc::new(Node::new(node, _running));
         state::set_node(node.clone());
+
+        orderbook::subscribe(
+            node.inner.node_key(),
+            runtime,
+            tx.orderbook,
+            fcm_token,
+            tx_websocket,
+        )?;
 
         if let Err(e) = spawn_blocking({
             let node = node.clone();
@@ -825,6 +866,8 @@ fn update_state_after_collab_revert(
                 order_type: OrderType::Market,
                 state: OrderState::Filled {
                     execution_price: execution_price.to_f32().expect("to fit into f32"),
+                    // this fee here doesn't matter because it's not being used anywhere
+                    matching_fee: Amount::ZERO,
                 },
                 creation_timestamp: OffsetDateTime::now_utc(),
                 order_expiry_timestamp: OffsetDateTime::now_utc(),
@@ -839,17 +882,6 @@ fn update_state_after_collab_revert(
     };
 
     position::handler::update_position_after_dlc_closure(Some(filled_order))?;
-
-    match db::delete_positions() {
-        Ok(_) => {
-            event::publish(&EventInternal::PositionCloseNotification(
-                ContractSymbol::BtcUsd,
-            ));
-        }
-        Err(error) => {
-            tracing::error!("Could not delete position : {error:#}");
-        }
-    }
 
     let node = node.inner.clone();
 
@@ -974,6 +1006,19 @@ pub fn estimated_funding_tx_fee() -> Result<Amount> {
     let fee = fee / 2;
 
     Ok(fee)
+}
+
+/// Returns true if the provided address belongs to our wallet and false otherwise.
+/// Returns and error if the address is invalid.
+///
+/// Note, this may return false if the wallet doesn't know about the address. A full sync is
+/// required then.
+pub fn is_address_mine(address: &str) -> Result<bool> {
+    let address: Address<NetworkUnchecked> = address.parse().context("Failed to parse address")?;
+    let is_mine = state::get_node()
+        .inner
+        .is_mine(&address.payload.script_pubkey());
+    Ok(is_mine)
 }
 
 pub async fn estimate_payment_fee(amount: u64, address: &str, fee: Fee) -> Result<Option<Amount>> {

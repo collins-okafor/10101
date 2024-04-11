@@ -12,6 +12,7 @@ use crate::trade;
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
+use bitcoin::Amount;
 use bitcoin::Network;
 use diesel::connection::SimpleConnection;
 use diesel::r2d2;
@@ -147,14 +148,41 @@ pub fn insert_order(order: trade::order::Order) -> Result<trade::order::Order> {
     Ok(order.try_into()?)
 }
 
-pub fn update_order_state(
+impl From<trade::order::OrderState> for OrderState {
+    fn from(value: trade::order::OrderState) -> Self {
+        match value {
+            trade::order::OrderState::Initial => OrderState::Initial,
+            trade::order::OrderState::Rejected => OrderState::Rejected,
+            trade::order::OrderState::Open => OrderState::Open,
+            trade::order::OrderState::Filling { .. } => OrderState::Filling,
+            trade::order::OrderState::Failed { .. } => OrderState::Failed,
+            trade::order::OrderState::Filled { .. } => OrderState::Filled,
+        }
+    }
+}
+
+pub fn set_order_state_to_failed(
     order_id: Uuid,
-    order_state: trade::order::OrderState,
+    failure_reason: FailureReason,
+    execution_price: Option<f32>,
 ) -> Result<trade::order::Order> {
     let mut db = connection()?;
+    let order = Order::set_order_state_to_failed(
+        order_id.to_string(),
+        execution_price,
+        None,
+        failure_reason,
+        &mut db,
+    )
+    .context("Failed to set order state to failed")?;
 
-    let order = Order::update_state(order_id.to_string(), order_state.into(), &mut db)
-        .context("Failed to update order state")?;
+    Ok(order.try_into()?)
+}
+
+pub fn set_order_state_to_open(order_id: Uuid) -> Result<trade::order::Order> {
+    let mut db = connection()?;
+    let order = Order::set_order_state_to_open(order_id.to_string(), &mut db)
+        .context("Failed to set order state to open")?;
 
     Ok(order.try_into()?)
 }
@@ -244,6 +272,32 @@ pub fn get_last_failed_order() -> Result<Option<trade::order::Order>> {
     Ok(order)
 }
 
+pub fn set_order_state_to_filled(
+    order_id: Uuid,
+    execution_price: f32,
+    matching_fee: Amount,
+) -> Result<trade::order::Order> {
+    let mut connection = connection()?;
+    let order =
+        Order::set_order_state_to_filled(order_id, execution_price, matching_fee, &mut connection)?;
+    Ok(order.try_into()?)
+}
+
+pub fn set_order_state_to_filling(
+    order_id: Uuid,
+    execution_price: f32,
+    matching_fee: Amount,
+) -> Result<trade::order::Order> {
+    let mut connection = connection()?;
+    let order = Order::set_order_state_to_filling(
+        order_id,
+        execution_price,
+        matching_fee,
+        &mut connection,
+    )?;
+    Ok(order.try_into()?)
+}
+
 /// Return an [`Order`] that is currently in [`OrderState::Filling`].
 pub fn get_order_in_filling() -> Result<Option<trade::order::Order>> {
     let mut db = connection()?;
@@ -270,13 +324,11 @@ pub fn get_order_in_filling() -> Result<Option<trade::order::Order>> {
                     "Setting unexpected Filling order to Failed"
                 );
 
-                if let Err(e) = Order::update_state(
+                if let Err(e) = Order::set_order_state_to_failed(
                     order.id.clone(),
-                    (
-                        OrderState::Failed,
-                        Some(order.execution_price.expect("in Filling state")),
-                        Some(FailureReason::TimedOut),
-                    ),
+                    order.execution_price,
+                    None,
+                    FailureReason::TimedOut,
                     &mut db,
                 ) {
                     tracing::error!("Failed to set old Filling order to Failed: {e:#}");
@@ -325,12 +377,12 @@ pub fn delete_positions() -> Result<()> {
 pub fn update_position_state(
     contract_symbol: ::trade::ContractSymbol,
     position_state: trade::position::PositionState,
-) -> Result<()> {
+) -> Result<trade::position::Position> {
     let mut db = connection()?;
-    Position::update_state(contract_symbol.into(), position_state.into(), &mut db)
+    let position = Position::update_state(contract_symbol.into(), position_state.into(), &mut db)
         .context("Failed to update position state")?;
 
-    Ok(())
+    Ok(position.into())
 }
 
 pub fn update_position(resized_position: trade::position::Position) -> Result<()> {

@@ -36,6 +36,7 @@ use tokio::sync::RwLock;
 
 pub mod channel;
 pub mod expired_positions;
+pub mod liquidated_positions;
 pub mod rollover;
 pub mod storage;
 pub mod unrealized_pnl;
@@ -45,6 +46,8 @@ pub struct NodeSettings {
     // At times, we want to disallow opening new positions (e.g. before
     // scheduled upgrade)
     pub allow_opening_positions: bool,
+    pub maintenance_margin_rate: f32,
+    pub order_matching_fee_rate: f32,
 }
 
 #[derive(Clone)]
@@ -403,9 +406,10 @@ impl Node {
                                     "DLC Channel offer has been rejected. Setting position to failed."
                                 );
 
-                                db::positions::Position::update_proposed_position(
+                                db::positions::Position::update_position_state(
                                     &mut connection,
                                     node_id.to_string(),
+                                    vec![PositionState::Proposed],
                                     PositionState::Failed,
                                 )?;
                             }
@@ -439,9 +443,10 @@ impl Node {
                                     "DLC Channel renew offer has been rejected. Setting position to failed."
                                 );
 
-                                db::positions::Position::update_proposed_position(
+                                db::positions::Position::update_position_state(
                                     &mut connection,
                                     node_id.to_string(),
+                                    vec![PositionState::Proposed],
                                     PositionState::Failed,
                                 )?;
                             }

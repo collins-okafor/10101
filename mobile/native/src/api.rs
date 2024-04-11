@@ -20,7 +20,6 @@ use crate::ln_dlc;
 use crate::ln_dlc::get_storage;
 use crate::logger;
 use crate::max_quantity::max_quantity;
-use crate::orderbook;
 use crate::polls;
 use crate::trade::order;
 use crate::trade::order::api::NewOrder;
@@ -33,7 +32,6 @@ use anyhow::Context;
 use anyhow::Result;
 use bdk::FeeRate;
 use bitcoin::Amount;
-use commons::order_matching_fee_taker;
 use commons::ChannelOpeningParams;
 use commons::OrderbookRequest;
 use flutter_rust_bridge::frb;
@@ -60,20 +58,22 @@ pub fn init_logging(sink: StreamSink<logger::LogEntry>) {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct LspConfig {
-    pub contract_tx_fee_rate: u64,
+pub struct TenTenOneConfig {
     pub liquidity_options: Vec<LiquidityOption>,
+    pub min_quantity: u64,
+    pub maintenance_margin_rate: f32,
 }
 
-impl From<commons::LspConfig> for LspConfig {
-    fn from(value: commons::LspConfig) -> Self {
+impl From<commons::TenTenOneConfig> for TenTenOneConfig {
+    fn from(value: commons::TenTenOneConfig) -> Self {
         Self {
-            contract_tx_fee_rate: value.contract_tx_fee_rate,
             liquidity_options: value
                 .liquidity_options
                 .into_iter()
                 .map(|lo| lo.into())
                 .collect(),
+            min_quantity: value.min_quantity,
+            maintenance_margin_rate: value.maintenance_margin_rate,
         }
     }
 }
@@ -239,7 +239,7 @@ pub enum WalletHistoryItemType {
     },
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Copy)]
 pub enum PaymentFlow {
     #[default]
     Inbound,
@@ -292,8 +292,12 @@ pub fn calculate_liquidation_price(
     leverage: f32,
     direction: Direction,
 ) -> SyncReturn<f32> {
+    let maintenance_margin_rate = ln_dlc::get_maintenance_margin_rate();
     SyncReturn(calculations::calculate_liquidation_price(
-        price, leverage, direction,
+        price,
+        leverage,
+        direction,
+        maintenance_margin_rate,
     ))
 }
 
@@ -326,7 +330,8 @@ pub fn calculate_pnl(
 pub fn order_matching_fee(quantity: f32, price: f32) -> SyncReturn<u64> {
     let price = Decimal::from_f32(price).expect("price to fit in Decimal");
 
-    let order_matching_fee = order_matching_fee_taker(quantity, price).to_sat();
+    let fee_rate = ln_dlc::get_order_matching_fee_rate();
+    let order_matching_fee = commons::order_matching_fee(quantity, price, fee_rate).to_sat();
 
     SyncReturn(order_matching_fee)
 }
@@ -522,15 +527,7 @@ fn run_internal(
 
     let (_health, tx) = health::Health::new(runtime);
 
-    orderbook::subscribe(
-        ln_dlc::get_node_key(),
-        runtime,
-        tx.orderbook,
-        fcm_token,
-        tx_websocket,
-    )?;
-
-    ln_dlc::run(runtime)
+    ln_dlc::run(runtime, tx, fcm_token, tx_websocket)
 }
 
 pub fn get_new_address() -> Result<String> {
@@ -725,9 +722,10 @@ pub fn init_new_mnemonic(target_seed_file_path: String) -> Result<()> {
 
 /// Enroll or update a user in the beta program
 #[tokio::main(flavor = "current_thread")]
-pub async fn register_beta(contact: String) -> Result<()> {
+pub async fn register_beta(contact: String, referral_code: Option<String>) -> Result<()> {
     let version = env!("CARGO_PKG_VERSION").to_string();
-    users::register_beta(contact, version).await
+
+    users::register_beta(contact, version, referral_code).await
 }
 
 #[derive(Debug)]
@@ -829,4 +827,63 @@ pub fn roll_back_channel_state() -> Result<()> {
         "Executing emergency kit! Attempting to rollback channel state to last stable state"
     );
     ln_dlc::roll_back_channel_state()
+}
+
+pub struct ReferralStatus {
+    pub referral_code: String,
+    pub number_of_activated_referrals: usize,
+    pub number_of_total_referrals: usize,
+    pub referral_tier: usize,
+    pub referral_fee_bonus: f32,
+    /// The type of this referral status
+    pub bonus_status_type: BonusStatusType,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum BonusStatusType {
+    #[default]
+    None,
+    /// The bonus is because he referred enough users
+    Referral,
+    /// The user has been referred and gets a bonus
+    Referent,
+}
+
+impl From<commons::BonusStatusType> for BonusStatusType {
+    fn from(value: commons::BonusStatusType) -> Self {
+        match value {
+            commons::BonusStatusType::Referral => BonusStatusType::Referral,
+            commons::BonusStatusType::Referent => BonusStatusType::Referent,
+        }
+    }
+}
+
+impl From<commons::ReferralStatus> for ReferralStatus {
+    fn from(value: commons::ReferralStatus) -> Self {
+        ReferralStatus {
+            referral_code: value.referral_code,
+            referral_tier: value.referral_tier,
+            number_of_activated_referrals: value.number_of_activated_referrals,
+            number_of_total_referrals: value.number_of_total_referrals,
+            referral_fee_bonus: value.referral_fee_bonus.to_f32().expect("to fit into f32"),
+            bonus_status_type: value
+                .bonus_status_type
+                .map(|status| status.into())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn referral_status() -> Result<ReferralStatus> {
+    let referral = match crate::state::try_get_tentenone_config() {
+        Some(config) => config.referral_status,
+        None => commons::ReferralStatus::new(ln_dlc::get_node_pubkey()),
+    };
+    Ok(referral.into())
+}
+
+/// Returns true if the user has at least a single trade in his db
+pub fn has_traded_once() -> Result<SyncReturn<bool>> {
+    Ok(SyncReturn(!db::get_all_trades()?.is_empty()))
 }

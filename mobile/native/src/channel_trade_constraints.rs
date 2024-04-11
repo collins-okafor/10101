@@ -24,22 +24,28 @@ pub struct TradeConstraints {
     pub is_channel_balance: bool,
     /// Smallest allowed margin
     pub min_margin: u64,
+    /// The maintenance margin in percent defines the margin requirement left in the dlc channel.
+    /// If the margin drops below that value the position gets liquidated.
+    pub maintenance_margin_rate: f32,
+    /// The fee rate for order matching.
+    pub order_matching_fee_rate: f32,
 }
 
 pub fn channel_trade_constraints() -> Result<TradeConstraints> {
-    let lsp_config =
-        crate::state::try_get_lsp_config().context("We can't trade without LSP config")?;
+    let config =
+        crate::state::try_get_tentenone_config().context("We can't trade without LSP config")?;
 
     let signed_channel = ln_dlc::get_signed_dlc_channel()?;
 
-    // TODO(bonomat): retrieve these values from the coordinator. This can come from the liquidity
-    // options.
-    let min_quantity = 1;
     let min_margin = signed_channel.map(|_| 1).unwrap_or(250_000);
+
+    let min_quantity = config.min_quantity;
+    let maintenance_margin_rate = config.maintenance_margin_rate;
+    let order_matching_fee_rate = config.order_matching_fee_rate;
 
     // TODO(bonomat): this logic should be removed once we have our liquidity options again and the
     // on-boarding logic. For now we take the highest liquidity option
-    let option = lsp_config
+    let option = config
         .liquidity_options
         .iter()
         .filter(|option| option.active)
@@ -66,6 +72,8 @@ pub fn channel_trade_constraints() -> Result<TradeConstraints> {
                 min_quantity,
                 is_channel_balance: false,
                 min_margin,
+                maintenance_margin_rate,
+                order_matching_fee_rate,
             }
         }
         Some(_) => {
@@ -79,6 +87,8 @@ pub fn channel_trade_constraints() -> Result<TradeConstraints> {
                 min_quantity,
                 is_channel_balance: true,
                 min_margin,
+                maintenance_margin_rate,
+                order_matching_fee_rate,
             }
         }
     };

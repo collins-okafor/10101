@@ -26,6 +26,8 @@ mod orderbook;
 mod polls;
 mod storage;
 
+pub use ln_dlc::get_maintenance_margin_rate;
+
 #[allow(
     clippy::all,
     clippy::unwrap_used,
@@ -33,3 +35,4 @@ mod storage;
     unused_qualifications
 )]
 mod bridge_generated;
+mod position;

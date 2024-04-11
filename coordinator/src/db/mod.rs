@@ -1,3 +1,5 @@
+pub mod bonus_status;
+pub mod bonus_tiers;
 pub mod channel_opening_params;
 pub mod collaborative_reverts;
 pub mod custom_types;
@@ -7,9 +9,9 @@ pub mod dlc_protocols;
 pub mod last_outbound_dlc_message;
 pub mod liquidity;
 pub mod liquidity_options;
+pub mod orders_helper;
 pub mod polls;
 pub mod positions;
-pub mod positions_helper;
 pub mod spendable_outputs;
 pub mod trade_params;
 pub mod trades;

@@ -5,7 +5,7 @@ import 'package:get_10101/bridge_generated/bridge_definitions.dart' as bridge;
 import 'package:get_10101/common/amount_denomination_change_notifier.dart';
 @GenerateNiceMocks([MockSpec<ChannelInfoService>()])
 import 'package:get_10101/common/application/channel_info_service.dart';
-import 'package:get_10101/common/application/lsp_change_notifier.dart';
+import 'package:get_10101/common/application/tentenone_config_change_notifier.dart';
 @GenerateNiceMocks([MockSpec<DlcChannelService>()])
 import 'package:get_10101/common/dlc_channel_service.dart';
 import 'package:get_10101/common/dlc_channel_change_notifier.dart';
@@ -20,7 +20,7 @@ import 'package:get_10101/features/trade/application/position_service.dart';
 @GenerateNiceMocks([MockSpec<TradeValuesService>()])
 import 'package:get_10101/features/trade/application/trade_values_service.dart';
 import 'package:get_10101/features/trade/candlestick_change_notifier.dart';
-import 'package:get_10101/features/trade/domain/price.dart';
+import 'package:get_10101/features/trade/domain/direction.dart';
 import 'package:get_10101/features/trade/order_change_notifier.dart';
 import 'package:get_10101/features/trade/position_change_notifier.dart';
 import 'package:get_10101/features/trade/submit_order_change_notifier.dart';
@@ -122,7 +122,9 @@ void main() {
             coordinatorLeverage: 2,
             minQuantity: 1,
             isChannelBalance: true,
-            minMargin: 1));
+            minMargin: 1,
+            maintenanceMarginRate: 0.1,
+            orderMatchingFeeRate: 0.003));
 
     when(candlestickService.fetchCandles(1000)).thenAnswer((_) async {
       return getDummyCandles(1000);
@@ -141,16 +143,21 @@ void main() {
 
     PositionChangeNotifier positionChangeNotifier = PositionChangeNotifier(positionService);
 
-    LspChangeNotifier lspChangeNotifier = LspChangeNotifier(channelConstraintsService);
+    TenTenOneConfigChangeNotifier lspChangeNotifier =
+        TenTenOneConfigChangeNotifier(channelConstraintsService);
 
     DlcChannelChangeNotifier dlcChannelChangeNotifier = DlcChannelChangeNotifier(dlcChannelService);
 
     final tradeValuesChangeNotifier = TradeValuesChangeNotifier(tradeValueService);
 
-    final price = Price(bid: 30000.0, ask: 30000.0);
+    const askPrice = 30000.0;
+    const bidPrice = 30000.0;
+
     // We have to have current price, otherwise we can't take order
-    positionChangeNotifier.price = price;
-    tradeValuesChangeNotifier.updatePrice(price);
+    positionChangeNotifier.askPrice = askPrice;
+    positionChangeNotifier.bidPrice = bidPrice;
+    tradeValuesChangeNotifier.updatePrice(askPrice, Direction.short);
+    tradeValuesChangeNotifier.updatePrice(bidPrice, Direction.long);
 
     await tester.pumpWidget(MultiProvider(providers: [
       ChangeNotifierProvider(create: (context) => tradeValuesChangeNotifier),
@@ -236,7 +243,9 @@ void main() {
             coordinatorLeverage: 2,
             minQuantity: 1,
             isChannelBalance: true,
-            minMargin: 1));
+            minMargin: 1,
+            maintenanceMarginRate: 0.1,
+            orderMatchingFeeRate: 0.003));
 
     when(dlcChannelService.getEstimatedChannelFeeReserve()).thenReturn((Amount(500)));
 
@@ -263,17 +272,22 @@ void main() {
 
     PositionChangeNotifier positionChangeNotifier = PositionChangeNotifier(positionService);
 
-    LspChangeNotifier lspChangeNotifier = LspChangeNotifier(channelConstraintsService);
+    TenTenOneConfigChangeNotifier lspChangeNotifier =
+        TenTenOneConfigChangeNotifier(channelConstraintsService);
 
     DlcChannelChangeNotifier dlcChannelChangeNotifier = DlcChannelChangeNotifier(dlcChannelService);
     dlcChannelChangeNotifier.initialize();
 
     final tradeValuesChangeNotifier = TradeValuesChangeNotifier(tradeValueService);
 
-    final price = Price(bid: 30000.0, ask: 30000.0);
+    const askPrice = 30000.0;
+    const bidPrice = 30000.0;
+
     // We have to have current price, otherwise we can't take order
-    positionChangeNotifier.price = price;
-    tradeValuesChangeNotifier.updatePrice(price);
+    positionChangeNotifier.askPrice = askPrice;
+    positionChangeNotifier.bidPrice = bidPrice;
+    tradeValuesChangeNotifier.updatePrice(askPrice, Direction.short);
+    tradeValuesChangeNotifier.updatePrice(bidPrice, Direction.long);
 
     await tester.pumpWidget(MultiProvider(providers: [
       ChangeNotifierProvider(create: (context) => tradeValuesChangeNotifier),

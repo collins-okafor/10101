@@ -48,6 +48,24 @@ pub struct Settings {
     /// *     *     *      *              *       *             *
     pub close_expired_position_scheduler: String,
 
+    // We don't want the doc block below to be auto-formatted.
+    #[rustfmt::skip]
+    /// A cron syntax for sending notifications to close an expired position
+    ///
+    /// The format is :
+    /// sec   min   hour   day of month   month   day of week   year
+    /// *     *     *      *              *       *             *
+    pub close_liquidated_position_scheduler: String,
+
+    // We don't want the doc block below to be auto-formatted.
+    #[rustfmt::skip]
+    /// A cron syntax for updating users bonus status
+    ///
+    /// The format is :
+    /// sec   min   hour   day of month   month   day of week   year
+    /// *     *     *      *              *       *             *
+    pub update_user_bonus_status_scheduler: String,
+
     // Location of the settings file in the file system.
     path: PathBuf,
 
@@ -56,6 +74,17 @@ pub struct Settings {
 
     /// A list of makers who are allowed to post limit orders. This is to prevent spam.
     pub whitelisted_makers: Vec<PublicKey>,
+
+    /// The min quantity that we accept to be traded with.
+    pub min_quantity: u64,
+
+    /// The maintenance margin in percent, defining the required margin in the position. If the
+    /// margin drops below that the position gets liquidated.
+    pub maintenance_margin_rate: f32,
+
+    /// The order matching fee rate, which is charged for matching an order. Note, this is at the
+    /// moment applied for taker and maker orders.
+    pub order_matching_fee_rate: f32,
 }
 
 impl Settings {
@@ -89,6 +118,8 @@ impl Settings {
     pub fn to_node_settings(&self) -> NodeSettings {
         NodeSettings {
             allow_opening_positions: self.new_positions_enabled,
+            maintenance_margin_rate: self.maintenance_margin_rate,
+            order_matching_fee_rate: self.order_matching_fee_rate,
         }
     }
 
@@ -104,9 +135,14 @@ impl Settings {
             rollover_window_open_scheduler: file.rollover_window_open_scheduler,
             rollover_window_close_scheduler: file.rollover_window_close_scheduler,
             close_expired_position_scheduler: file.close_expired_position_scheduler,
+            close_liquidated_position_scheduler: file.close_liquidated_position_scheduler,
+            update_user_bonus_status_scheduler: file.update_user_bonus_status_scheduler,
             path,
             whitelist_enabled: file.whitelist_enabled,
             whitelisted_makers: file.whitelisted_makers,
+            min_quantity: file.min_quantity,
+            maintenance_margin_rate: file.maintenance_margin_rate,
+            order_matching_fee_rate: file.order_matching_fee_rate,
         }
     }
 }
@@ -123,9 +159,15 @@ pub struct SettingsFile {
     rollover_window_close_scheduler: String,
 
     close_expired_position_scheduler: String,
+    close_liquidated_position_scheduler: String,
+    update_user_bonus_status_scheduler: String,
 
     whitelist_enabled: bool,
     whitelisted_makers: Vec<PublicKey>,
+
+    min_quantity: u64,
+    maintenance_margin_rate: f32,
+    order_matching_fee_rate: f32,
 }
 
 impl From<Settings> for SettingsFile {
@@ -137,8 +179,13 @@ impl From<Settings> for SettingsFile {
             rollover_window_open_scheduler: value.rollover_window_open_scheduler,
             rollover_window_close_scheduler: value.rollover_window_close_scheduler,
             close_expired_position_scheduler: value.close_expired_position_scheduler,
+            close_liquidated_position_scheduler: value.close_liquidated_position_scheduler,
+            update_user_bonus_status_scheduler: value.update_user_bonus_status_scheduler,
             whitelist_enabled: false,
             whitelisted_makers: value.whitelisted_makers,
+            min_quantity: value.min_quantity,
+            maintenance_margin_rate: value.maintenance_margin_rate,
+            order_matching_fee_rate: value.order_matching_fee_rate,
         }
     }
 }
@@ -163,11 +210,16 @@ mod tests {
             rollover_window_open_scheduler: "foo".to_string(),
             rollover_window_close_scheduler: "bar".to_string(),
             close_expired_position_scheduler: "baz".to_string(),
+            close_liquidated_position_scheduler: "baz".to_string(),
+            update_user_bonus_status_scheduler: "bazinga".to_string(),
             whitelist_enabled: false,
             whitelisted_makers: vec![PublicKey::from_str(
                 "0218845781f631c48f1c9709e23092067d06837f30aa0cd0544ac887fe91ddd166",
             )
             .unwrap()],
+            min_quantity: 1,
+            maintenance_margin_rate: 0.1,
+            order_matching_fee_rate: 0.003,
         };
 
         let serialized = toml::to_string_pretty(&original).unwrap();

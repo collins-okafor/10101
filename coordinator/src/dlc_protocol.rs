@@ -5,7 +5,8 @@ use crate::trade::websocket::InternalPositionUpdateMessage;
 use anyhow::Context;
 use anyhow::Result;
 use bitcoin::secp256k1::PublicKey;
-use commons::order_matching_fee_taker;
+use bitcoin::Amount;
+use bitcoin::SignedAmount;
 use diesel::r2d2::ConnectionManager;
 use diesel::r2d2::Pool;
 use diesel::result::Error::RollbackTransaction;
@@ -23,7 +24,6 @@ use std::fmt::Formatter;
 use std::str::from_utf8;
 use time::OffsetDateTime;
 use tokio::sync::broadcast::Sender;
-use trade::cfd::calculate_margin;
 use trade::cfd::calculate_pnl;
 use trade::Direction;
 use uuid::Uuid;
@@ -119,10 +119,16 @@ pub struct TradeParams {
     pub leverage: f32,
     pub average_price: f32,
     pub direction: Direction,
+    pub matching_fee: Amount,
+    pub trader_pnl: Option<SignedAmount>,
 }
 
-impl From<(ProtocolId, &commons::TradeParams)> for TradeParams {
-    fn from((protocol_id, trade_params): (ProtocolId, &commons::TradeParams)) -> Self {
+impl TradeParams {
+    fn new(
+        trade_params: &commons::TradeParams,
+        protocol_id: ProtocolId,
+        trader_pnl: Option<SignedAmount>,
+    ) -> Self {
         Self {
             protocol_id,
             trader: trade_params.pubkey,
@@ -131,8 +137,10 @@ impl From<(ProtocolId, &commons::TradeParams)> for TradeParams {
             average_price: trade_params
                 .average_execution_price()
                 .to_f32()
-                .expect("to fit into f32"),
+                .expect("to fit"),
             direction: trade_params.direction,
+            matching_fee: trade_params.order_matching_fee(),
+            trader_pnl,
         }
     }
 }
@@ -145,21 +153,70 @@ pub enum DlcProtocolState {
 
 #[derive(Clone, Debug)]
 pub enum DlcProtocolType {
-    Open { trade_params: TradeParams },
-    Renew { trade_params: TradeParams },
-    Settle { trade_params: TradeParams },
-    Close { trader: PublicKey },
-    ForceClose { trader: PublicKey },
-    Rollover { trader: PublicKey },
+    /// Opening a channel also opens a position.
+    OpenChannel {
+        trade_params: TradeParams,
+    },
+    OpenPosition {
+        trade_params: TradeParams,
+    },
+    ResizePosition {
+        trade_params: TradeParams,
+    },
+    Rollover {
+        trader: PublicKey,
+    },
+    Settle {
+        trade_params: TradeParams,
+    },
+    Close {
+        trader: PublicKey,
+    },
+    ForceClose {
+        trader: PublicKey,
+    },
+}
+
+impl DlcProtocolType {
+    pub fn open_channel(trade_params: &commons::TradeParams, protocol_id: ProtocolId) -> Self {
+        Self::OpenChannel {
+            trade_params: TradeParams::new(trade_params, protocol_id, None),
+        }
+    }
+
+    pub fn open_position(trade_params: &commons::TradeParams, protocol_id: ProtocolId) -> Self {
+        Self::OpenPosition {
+            trade_params: TradeParams::new(trade_params, protocol_id, None),
+        }
+    }
+
+    pub fn resize_position(
+        trade_params: &commons::TradeParams,
+        protocol_id: ProtocolId,
+        trader_pnl: Option<SignedAmount>,
+    ) -> Self {
+        Self::ResizePosition {
+            trade_params: TradeParams::new(trade_params, protocol_id, trader_pnl),
+        }
+    }
+
+    pub fn settle(trade_params: &commons::TradeParams, protocol_id: ProtocolId) -> Self {
+        Self::Settle {
+            trade_params: TradeParams::new(trade_params, protocol_id, None),
+        }
+    }
 }
 
 impl DlcProtocolType {
     pub fn get_trader_pubkey(&self) -> &PublicKey {
         match self {
-            DlcProtocolType::Open {
+            DlcProtocolType::OpenChannel {
                 trade_params: TradeParams { trader, .. },
             } => trader,
-            DlcProtocolType::Renew {
+            DlcProtocolType::OpenPosition {
+                trade_params: TradeParams { trader, .. },
+            } => trader,
+            DlcProtocolType::ResizePosition {
                 trade_params: TradeParams { trader, .. },
             } => trader,
             DlcProtocolType::Settle {
@@ -206,8 +263,9 @@ impl DlcProtocolExecutor {
             )?;
 
             match protocol_type {
-                DlcProtocolType::Open { trade_params }
-                | DlcProtocolType::Renew { trade_params }
+                DlcProtocolType::OpenChannel { trade_params }
+                | DlcProtocolType::OpenPosition { trade_params }
+                | DlcProtocolType::ResizePosition { trade_params }
                 | DlcProtocolType::Settle { trade_params } => {
                     db::trade_params::insert(conn, protocol_id, &trade_params)?;
                 }
@@ -240,12 +298,24 @@ impl DlcProtocolExecutor {
         let dlc_protocol = db::dlc_protocols::get_dlc_protocol(&mut conn, protocol_id)?;
         conn.transaction(|conn| {
             match &dlc_protocol.protocol_type {
-                DlcProtocolType::Open { trade_params }
-                | DlcProtocolType::Renew { trade_params } => {
+                DlcProtocolType::OpenChannel { trade_params }
+                | DlcProtocolType::OpenPosition { trade_params } => {
                     let contract_id = contract_id
                         .context("missing contract id")
                         .map_err(|_| RollbackTransaction)?;
-                    self.finish_open_trade_dlc_protocol(
+                    self.finish_open_position_dlc_protocol(
+                        conn,
+                        trade_params,
+                        protocol_id,
+                        &contract_id,
+                        channel_id,
+                    )
+                }
+                DlcProtocolType::ResizePosition { trade_params } => {
+                    let contract_id = contract_id
+                        .context("missing contract id")
+                        .map_err(|_| RollbackTransaction)?;
+                    self.finish_resize_position_dlc_protocol(
                         conn,
                         trade_params,
                         protocol_id,
@@ -286,8 +356,9 @@ impl DlcProtocolExecutor {
         })?;
 
         match &dlc_protocol.protocol_type {
-            DlcProtocolType::Open { trade_params }
-            | DlcProtocolType::Renew { trade_params }
+            DlcProtocolType::OpenChannel { trade_params }
+            | DlcProtocolType::OpenPosition { trade_params }
+            | DlcProtocolType::ResizePosition { trade_params }
             | DlcProtocolType::Settle { trade_params } => {
                 if let Err(e) = {
                     tx_position_feed.send(InternalPositionUpdateMessage::NewTrade {
@@ -304,7 +375,8 @@ impl DlcProtocolExecutor {
                 }
             }
             _ => {
-                // a trade only happens in Open, Renew and Settle
+                // A trade only happens in `OpenChannel`, `OpenPosition`, `ResizePosition` and
+                // `Settle`.
             }
         }
 
@@ -380,35 +452,24 @@ impl DlcProtocolExecutor {
             }
         };
 
+        let closing_price =
+            Decimal::try_from(trade_params.average_price).expect("to fit into decimal");
+
         db::positions::Position::set_position_to_closed_with_pnl(
             conn,
             position.id,
             trader_realized_pnl_sat,
+            closing_price,
         )?;
 
-        let coordinator_margin = calculate_margin(
-            Decimal::try_from(trade_params.average_price).expect("to fit into decimal"),
-            trade_params.quantity,
-            crate::trade::coordinator_leverage_for_trade(&trade_params.trader)
-                .map_err(|_| RollbackTransaction)?,
-        );
+        let order_matching_fee = trade_params.matching_fee;
 
-        // TODO(holzeis): its a bit ugly to calculate the order matching fee like that. The user
-        // might get a discount at some point. So ideally the order matching fee is decided on the
-        // trade params at a single point and then only stored here.
-        let price = Decimal::try_from(trade_params.average_price).expect("to fit into f32");
-        let order_matching_fee = order_matching_fee_taker(trade_params.quantity, price);
-
-        // TODO(holzeis): Add optional pnl to trade.
-        // Instead of tracking pnl on the position we want to track pnl on the trade. e.g. Long
-        // -> Short or Short -> Long.
         let new_trade = NewTrade {
             position_id: position.id,
             contract_symbol: position.contract_symbol,
             trader_pubkey: trade_params.trader,
             quantity: trade_params.quantity,
             trader_leverage: trade_params.leverage,
-            coordinator_margin: coordinator_margin as i64,
             trader_direction: trade_params.direction,
             average_price: trade_params.average_price,
             order_matching_fee,
@@ -420,12 +481,15 @@ impl DlcProtocolExecutor {
         Ok(())
     }
 
-    /// Completes the open trade dlc protocol as successful and updates the 10101 meta data
-    /// accordingly in a single database transaction.
-    /// - Set dlc protocol to success
-    /// - Updates the `[PostionState::Proposed`] position state to `[PostionState::Open]`
-    /// - Creates and inserts the new trade
-    fn finish_open_trade_dlc_protocol(
+    /// Complete a DLC protocol that opens a position, by updating several database tables in a
+    /// single transaction.
+    ///
+    /// Specifically, we:
+    ///
+    /// - Set DLC protocol to success.
+    /// - Update the position state to [`PositionState::Open`].
+    /// - Create and insert the new trade.
+    fn finish_open_position_dlc_protocol(
         &self,
         conn: &mut PgConnection,
         trade_params: &TradeParams,
@@ -443,39 +507,71 @@ impl DlcProtocolExecutor {
         // TODO(holzeis): We are still updating the position based on the position state. This
         // will change once we only have a single position per user and representing
         // the position only as view on multiple trades.
-        let position = db::positions::Position::update_proposed_position(
+        let position = db::positions::Position::update_position_state(
             conn,
             trade_params.trader.to_string(),
+            vec![PositionState::Proposed],
             PositionState::Open,
         )?;
 
-        let coordinator_margin = calculate_margin(
-            Decimal::try_from(trade_params.average_price).expect("to fit into decimal"),
-            trade_params.quantity,
-            crate::trade::coordinator_leverage_for_trade(&trade_params.trader)
-                .map_err(|_| RollbackTransaction)?,
-        );
+        let order_matching_fee = trade_params.matching_fee;
 
-        // TODO(holzeis): its a bit ugly to calculate the order matching fee like that. The user
-        // might get a discount at some point. So ideally the order matching fee is decided on the
-        // trade params at a single point and then only stored here.
-        let price = Decimal::try_from(trade_params.average_price).expect("to fit into f32");
-        let order_matching_fee = order_matching_fee_taker(trade_params.quantity, price);
-
-        // TODO(holzeis): Add optional pnl to trade.
-        // Instead of tracking pnl on the position we want to track pnl on the trade. e.g. Long
-        // -> Short or Short -> Long.
         let new_trade = NewTrade {
             position_id: position.id,
             contract_symbol: position.contract_symbol,
             trader_pubkey: trade_params.trader,
             quantity: trade_params.quantity,
             trader_leverage: trade_params.leverage,
-            coordinator_margin: coordinator_margin as i64,
             trader_direction: trade_params.direction,
             average_price: trade_params.average_price,
             order_matching_fee,
             trader_realized_pnl_sat: None,
+        };
+
+        db::trades::insert(conn, new_trade)?;
+
+        Ok(())
+    }
+
+    /// Complete a DLC protocol that resizes a position, by updating several database tables in a
+    /// single transaction.
+    fn finish_resize_position_dlc_protocol(
+        &self,
+        conn: &mut PgConnection,
+        trade_params: &TradeParams,
+        protocol_id: ProtocolId,
+        contract_id: &ContractId,
+        channel_id: &DlcChannelId,
+    ) -> QueryResult<()> {
+        db::dlc_protocols::set_dlc_protocol_state_to_success(
+            conn,
+            protocol_id,
+            contract_id,
+            channel_id,
+        )?;
+
+        // TODO(holzeis): We are still updating the position based on the position state. This
+        // will change once we only have a single position per user and representing
+        // the position only as view on multiple trades.
+        let position = db::positions::Position::update_position_state(
+            conn,
+            trade_params.trader.to_string(),
+            vec![PositionState::Resizing],
+            PositionState::Open,
+        )?;
+
+        let order_matching_fee = trade_params.matching_fee;
+
+        let new_trade = NewTrade {
+            position_id: position.id,
+            contract_symbol: position.contract_symbol,
+            trader_pubkey: trade_params.trader,
+            quantity: trade_params.quantity,
+            trader_leverage: trade_params.leverage,
+            trader_direction: trade_params.direction,
+            average_price: trade_params.average_price,
+            order_matching_fee,
+            trader_realized_pnl_sat: trade_params.trader_pnl.map(|pnl| pnl.to_sat()),
         };
 
         db::trades::insert(conn, new_trade)?;

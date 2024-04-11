@@ -1,12 +1,14 @@
 use crate::db;
-use crate::db::positions_helper::get_all_open_positions_with_expiry_before;
+use crate::db::orders_helper::get_all_matched_market_orders_by_order_reason;
 use crate::message::OrderbookMessage;
 use crate::node::Node;
 use crate::notifications::Notification;
 use crate::notifications::NotificationKind;
+use crate::referrals;
 use crate::settings::Settings;
 use anyhow::Result;
 use bitcoin::Network;
+use commons::OrderReason;
 use diesel::r2d2::ConnectionManager;
 use diesel::r2d2::Pool;
 use diesel::PgConnection;
@@ -47,6 +49,23 @@ impl NotificationScheduler {
         }
     }
 
+    pub async fn update_bonus_status_for_users(
+        &self,
+        pool: Pool<ConnectionManager<PgConnection>>,
+    ) -> Result<()> {
+        let schedule = self.settings.update_user_bonus_status_scheduler.clone();
+
+        let uuid = self
+            .scheduler
+            .add(build_update_bonus_status_job(schedule.as_str(), pool)?)
+            .await?;
+        tracing::debug!(
+            job_id = uuid.to_string(),
+            "Started new job to update users bonus status"
+        );
+        Ok(())
+    }
+
     pub async fn add_reminder_to_close_expired_position_job(
         &self,
         pool: Pool<ConnectionManager<PgConnection>>,
@@ -57,6 +76,28 @@ impl NotificationScheduler {
         let uuid = self
             .scheduler
             .add(build_remind_to_close_expired_position_notification_job(
+                schedule.as_str(),
+                sender,
+                pool,
+            )?)
+            .await?;
+        tracing::debug!(
+            job_id = uuid.to_string(),
+            "Started new job to remind to close an expired position"
+        );
+        Ok(())
+    }
+
+    pub async fn add_reminder_to_close_liquidated_position_job(
+        &self,
+        pool: Pool<ConnectionManager<PgConnection>>,
+    ) -> Result<()> {
+        let sender = self.sender.clone();
+        let schedule = self.settings.close_liquidated_position_scheduler.clone();
+
+        let uuid = self
+            .scheduler
+            .add(build_remind_to_close_liquidated_position_notification_job(
                 schedule.as_str(),
                 sender,
                 pool,
@@ -140,7 +181,14 @@ fn build_rollover_notification_job(
 ) -> Result<Job, JobSchedulerError> {
     Job::new_async(schedule, move |_, _| {
         let notifier = notifier.clone();
-        let mut conn = pool.get().expect("To be able to get a db connection");
+        let mut conn = match pool.get() {
+            Ok(conn) => conn,
+            Err(e) => {
+                return Box::pin(async move {
+                    tracing::error!("Failed to get connection. Error: {e:#}")
+                });
+            }
+        };
 
         if !commons::is_eligible_for_rollover(OffsetDateTime::now_utc(), network) {
             return Box::pin(async move {
@@ -184,6 +232,38 @@ fn build_rollover_notification_job(
     })
 }
 
+fn build_update_bonus_status_job(
+    schedule: &str,
+    pool: Pool<ConnectionManager<PgConnection>>,
+) -> Result<Job, JobSchedulerError> {
+    Job::new_async(schedule, move |_, _| {
+        let mut conn = match pool.get() {
+            Ok(conn) => conn,
+            Err(e) => {
+                return Box::pin(async move {
+                    tracing::error!("Failed to get connection. Error: {e:#}")
+                });
+            }
+        };
+
+        match referrals::update_referral_status(&mut conn) {
+            Ok(number_of_updated_users) => Box::pin({
+                async move {
+                    tracing::debug!(
+                        number_of_updated_users,
+                        "Successfully updated users bonus status."
+                    )
+                }
+            }),
+            Err(error) => {
+                Box::pin(
+                    async move { tracing::error!("Could not load update bonus status {error:#}") },
+                )
+            }
+        }
+    })
+}
+
 fn build_remind_to_close_expired_position_notification_job(
     schedule: &str,
     notification_sender: mpsc::Sender<Notification>,
@@ -191,16 +271,23 @@ fn build_remind_to_close_expired_position_notification_job(
 ) -> Result<Job, JobSchedulerError> {
     Job::new_async(schedule, move |_, _| {
         let notification_sender = notification_sender.clone();
-        let mut conn = pool.get().expect("To be able to get a db connection");
+        let mut conn = match pool.get() {
+            Ok(conn) => conn,
+            Err(e) => {
+                return Box::pin(async move {
+                    tracing::error!("Failed to get connection. Error: {e:#}")
+                });
+            }
+        };
 
         // Note, positions that are expired longer than
         // [`crate::node::expired_positions::EXPIRED_POSITION_TIMEOUT`] are set to closing, hence
         // those positions will not get notified anymore afterwards.
-        match get_all_open_positions_with_expiry_before(&mut conn, OffsetDateTime::now_utc()) {
+        match get_all_matched_market_orders_by_order_reason(&mut conn, vec![OrderReason::Expired]) {
             Ok(positions_with_token) => Box::pin({
                 async move {
-                    for (position, fcm_token) in positions_with_token {
-                        tracing::debug!(trader_id=%position.trader, "Sending reminder to close expired position.");
+                    for (order, fcm_token) in positions_with_token {
+                        tracing::debug!(trader_id=%order.trader_id, "Sending reminder to close expired position.");
                         if let Err(e) = notification_sender
                             .send(Notification::new(
                                 fcm_token.clone(),
@@ -218,6 +305,64 @@ fn build_remind_to_close_expired_position_notification_job(
             }),
             Err(error) => Box::pin(async move {
                 tracing::error!("Could not load positions with fcm token {error:#}")
+            }),
+        }
+    })
+}
+
+fn build_remind_to_close_liquidated_position_notification_job(
+    schedule: &str,
+    notification_sender: mpsc::Sender<Notification>,
+    pool: Pool<ConnectionManager<PgConnection>>,
+) -> Result<Job, JobSchedulerError> {
+    Job::new_async(schedule, move |_, _| {
+        let notification_sender = notification_sender.clone();
+        let mut conn = match pool.get() {
+            Ok(conn) => conn,
+            Err(e) => {
+                return Box::pin(async move {
+                    tracing::error!("Failed to get connection. Error: {e:#}")
+                });
+            }
+        };
+
+        // Note, positions that are liquidated longer than
+        // [`crate::node::liquidated_positions::LIQUIDATED_POSITION_TIMEOUT`] are set to closing,
+        // hence those positions will not get notified anymore afterwards.
+        match get_all_matched_market_orders_by_order_reason(
+            &mut conn,
+            vec![
+                OrderReason::TraderLiquidated,
+                OrderReason::CoordinatorLiquidated,
+            ],
+        ) {
+            Ok(orders_with_token) => Box::pin({
+                async move {
+                    for (order, fcm_token) in orders_with_token {
+                        tracing::debug!(trader_id=%order.trader_id, "Sending reminder to close liquidated position.");
+
+                        let notification_kind = NotificationKind::Custom {
+                            title: "Pending liquidation 💸".to_string(),
+                            message: "Open your app to execute the liquidation ".to_string(),
+                        };
+
+                        if let Err(e) = notification_sender
+                            .send(Notification::new(
+                                fcm_token.clone(),
+                                notification_kind.clone(),
+                            ))
+                            .await
+                        {
+                            tracing::error!(
+                                "Failed to send {:?} notification: {e:?}",
+                                notification_kind
+                            );
+                        }
+                    }
+                }
+            }),
+            Err(error) => Box::pin(async move {
+                tracing::error!("Could not load orders with fcm token {error:#}")
             }),
         }
     })

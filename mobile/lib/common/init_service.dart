@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
-import 'package:get_10101/common/application/lsp_change_notifier.dart';
+import 'package:get_10101/common/application/tentenone_config_change_notifier.dart';
 import 'package:get_10101/common/dlc_channel_change_notifier.dart';
 import 'package:get_10101/common/dlc_channel_service.dart';
 import 'package:get_10101/common/domain/dlc_channel.dart';
-import 'package:get_10101/common/domain/lsp_config.dart';
+import 'package:get_10101/common/domain/tentenone_config.dart';
 import 'package:get_10101/common/full_sync_change_notifier.dart';
 import 'package:get_10101/features/brag/github_service.dart';
 import 'package:get_10101/features/trade/candlestick_change_notifier.dart';
@@ -29,7 +29,6 @@ import 'package:get_10101/common/domain/background_task.dart';
 import 'package:get_10101/common/domain/service_status.dart';
 import 'package:get_10101/features/trade/domain/order.dart';
 import 'package:get_10101/features/trade/domain/position.dart';
-import 'package:get_10101/features/trade/domain/price.dart';
 import 'package:get_10101/features/wallet/domain/wallet_info.dart';
 import 'package:get_10101/common/application/event_service.dart';
 import 'package:get_10101/logger/logger.dart';
@@ -66,7 +65,7 @@ List<SingleChildWidget> createProviders() {
     ChangeNotifierProvider(create: (context) => RolloverChangeNotifier()),
     ChangeNotifierProvider(create: (context) => RecoverDlcChangeNotifier()),
     ChangeNotifierProvider(create: (context) => CollabRevertChangeNotifier()),
-    ChangeNotifierProvider(create: (context) => LspChangeNotifier(channelInfoService)),
+    ChangeNotifierProvider(create: (context) => TenTenOneConfigChangeNotifier(channelInfoService)),
     ChangeNotifierProvider(create: (context) => PollChangeNotifier(pollService)),
     ChangeNotifierProvider(create: (context) => FullSyncChangeNotifier()),
     Provider(create: (context) => config),
@@ -95,7 +94,7 @@ void subscribeToNotifiers(BuildContext context) {
   final rolloverChangeNotifier = context.read<RolloverChangeNotifier>();
   final recoverDlcChangeNotifier = context.read<RecoverDlcChangeNotifier>();
   final collabRevertChangeNotifier = context.read<CollabRevertChangeNotifier>();
-  final lspConfigChangeNotifier = context.read<LspChangeNotifier>();
+  final tentenoneConfigChangeNotifier = context.read<TenTenOneConfigChangeNotifier>();
   final fullSyncChangeNotifier = context.read<FullSyncChangeNotifier>();
   final dlcChannelChangeNotifier = context.read<DlcChannelChangeNotifier>();
 
@@ -117,10 +116,14 @@ void subscribeToNotifiers(BuildContext context) {
       walletChangeNotifier, bridge.Event.walletInfoUpdateNotification(WalletInfo.apiDummy()));
 
   eventService.subscribe(
-      tradeValuesChangeNotifier, bridge.Event.priceUpdateNotification(Price.apiDummy()));
+      tradeValuesChangeNotifier, const bridge.Event.askPriceUpdateNotification(0.0));
+  eventService.subscribe(
+      tradeValuesChangeNotifier, const bridge.Event.bidPriceUpdateNotification(0.0));
 
   eventService.subscribe(
-      positionChangeNotifier, bridge.Event.priceUpdateNotification(Price.apiDummy()));
+      positionChangeNotifier, const bridge.Event.askPriceUpdateNotification(0.0));
+  eventService.subscribe(
+      positionChangeNotifier, const bridge.Event.bidPriceUpdateNotification(0.0));
 
   eventService.subscribe(
       serviceStatusNotifier, bridge.Event.serviceHealthUpdate(serviceUpdateApiDummy()));
@@ -139,7 +142,8 @@ void subscribeToNotifiers(BuildContext context) {
   eventService.subscribe(
       collabRevertChangeNotifier, bridge.Event.backgroundNotification(CollabRevert.apiDummy()));
 
-  eventService.subscribe(lspConfigChangeNotifier, bridge.Event.authenticated(LspConfig.apiDummy()));
+  eventService.subscribe(
+      tentenoneConfigChangeNotifier, bridge.Event.authenticated(TenTenOneConfig.apiDummy()));
 
   eventService.subscribe(
       fullSyncChangeNotifier, bridge.Event.backgroundNotification(FullSync.apiDummy()));

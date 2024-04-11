@@ -4,7 +4,9 @@ use crate::dlc_protocol::ProtocolId;
 use crate::node::Node;
 use anyhow::bail;
 use anyhow::Result;
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::Amount;
+use bitcoin::Txid;
 use dlc_manager::channel::signed_channel::SignedChannel;
 use dlc_manager::channel::signed_channel::SignedChannelState;
 use dlc_manager::channel::Channel;
@@ -12,10 +14,12 @@ use dlc_manager::channel::ClosedChannel;
 use dlc_manager::channel::ClosedPunishedChannel;
 use dlc_manager::channel::ClosingChannel;
 use dlc_manager::channel::SettledClosingChannel;
+use dlc_manager::DlcChannelId;
 use ln_dlc_node::bitcoin_conversion::to_secp_pk_30;
 use ln_dlc_node::bitcoin_conversion::to_txid_30;
 use ln_dlc_node::node::event::NodeEvent;
 use ln_dlc_storage::DlcChannelEvent;
+use time::OffsetDateTime;
 use tokio::sync::broadcast::error::RecvError;
 
 pub enum DlcChannelState {
@@ -25,6 +29,24 @@ pub enum DlcChannelState {
     Closed,
     Failed,
     Cancelled,
+}
+
+pub struct DlcChannel {
+    pub channel_id: DlcChannelId,
+    pub trader: PublicKey,
+    pub channel_state: DlcChannelState,
+    pub trader_reserve_sats: Amount,
+    pub coordinator_reserve_sats: Amount,
+    pub coordinator_funding_sats: Amount,
+    pub trader_funding_sats: Amount,
+    pub funding_txid: Option<Txid>,
+    pub close_txid: Option<Txid>,
+    pub settle_txid: Option<Txid>,
+    pub buffer_txid: Option<Txid>,
+    pub claim_txid: Option<Txid>,
+    pub punish_txid: Option<Txid>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
 }
 
 impl Node {
@@ -38,7 +60,10 @@ impl Node {
                     match receiver.recv().await {
                         Ok(NodeEvent::DlcChannelEvent { dlc_channel_event }) => {
                             if let Err(e) = node.process_dlc_channel_event(dlc_channel_event) {
-                                tracing::error!("Failed to get connection. Error: {e:#}");
+                                tracing::error!(
+                                    ?dlc_channel_event,
+                                    "Failed to process DLC channel event. Error: {e:#}"
+                                );
                             }
                         }
                         Ok(NodeEvent::Connected { .. })
@@ -110,7 +135,7 @@ impl Node {
                 let dlc_protocol = db::dlc_protocols::get_dlc_protocol(&mut conn, protocol_id)?;
 
                 match dlc_protocol.protocol_type {
-                    DlcProtocolType::Open { .. } => {
+                    DlcProtocolType::OpenChannel { .. } => {
                         db::dlc_channels::set_dlc_channel_open(
                             &mut conn,
                             &protocol_id,
@@ -122,10 +147,11 @@ impl Node {
                             trader_funding,
                         )?;
                     }
-                    DlcProtocolType::Renew { .. }
+                    DlcProtocolType::OpenPosition { .. }
                     | DlcProtocolType::Settle { .. }
-                    | DlcProtocolType::Rollover { .. } => {
-                        db::dlc_channels::update_channel_on_renew(
+                    | DlcProtocolType::Rollover { .. }
+                    | DlcProtocolType::ResizePosition { .. } => {
+                        db::dlc_channels::update_channel(
                             &mut conn,
                             &channel.get_id(),
                             coordinator_reserve,

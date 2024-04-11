@@ -10,13 +10,11 @@ use dlc_manager::payout_curve::PayoutPoint;
 use dlc_manager::payout_curve::PolynomialPayoutCurvePiece;
 use dlc_manager::payout_curve::RoundingInterval;
 use dlc_manager::payout_curve::RoundingIntervals;
-use payout_curve::ROUNDING_PERCENT;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use tracing::instrument;
-use trade::cfd::calculate_long_liquidation_price;
-use trade::cfd::calculate_short_liquidation_price;
-use trade::cfd::BTCUSD_MAX_PRICE;
+use trade::cfd::calculate_long_bankruptcy_price;
+use trade::cfd::calculate_short_bankruptcy_price;
 use trade::ContractSymbol;
 use trade::Direction;
 
@@ -74,6 +72,8 @@ pub fn build_contract_descriptor(
 /// Additionally returns the [`RoundingIntervals`] to indicate how it should be discretized.
 #[allow(clippy::too_many_arguments)]
 fn build_inverse_payout_function(
+    // TODO: The `coordinator_margin` and `trader_margin` are _not_ orthogonal to the other
+    // arguments passed in.
     coordinator_margin: u64,
     trader_margin: u64,
     initial_price: Decimal,
@@ -123,18 +123,6 @@ fn build_inverse_payout_function(
         coordinator_direction,
     )?;
 
-    // The payout curve generation code tends to shift the liquidation prices slightly.
-    let adjusted_long_liquidation_price = payout_points
-        .first()
-        .context("Empty payout points")?
-        .1
-        .event_outcome;
-    let adjusted_short_liquidation_price = payout_points
-        .last()
-        .context("Empty payout points")?
-        .0
-        .event_outcome;
-
     let mut pieces = vec![];
     for (lower, upper) in payout_points {
         let lower_range = PolynomialPayoutCurvePiece::new(vec![
@@ -155,20 +143,19 @@ fn build_inverse_payout_function(
     let payout_function =
         PayoutFunction::new(pieces).context("could not create payout function")?;
 
-    let rounding_intervals = {
-        let total_margin = coordinator_margin + trader_margin;
-
-        create_rounding_intervals(
-            total_margin,
-            adjusted_long_liquidation_price,
-            adjusted_short_liquidation_price,
-        )
+    let rounding_intervals = RoundingIntervals {
+        intervals: vec![RoundingInterval {
+            begin_interval: 0,
+            // No rounding needed because we are giving `rust-dlc` a step function already.
+            rounding_mod: 1,
+        }],
     };
 
     Ok((payout_function, rounding_intervals))
 }
 
-/// Returns the liquidation price for `(coordinator, maker)`
+/// Returns the liquidation price for `(coordinator, maker)` with a maintenance margin of 0%. also
+/// known as the bankruptcy price.
 fn get_liquidation_prices(
     initial_price: Decimal,
     coordinator_direction: Direction,
@@ -177,69 +164,21 @@ fn get_liquidation_prices(
 ) -> (Decimal, Decimal) {
     let (coordinator_liquidation_price, trader_liquidation_price) = match coordinator_direction {
         Direction::Long => (
-            calculate_long_liquidation_price(leverage_coordinator, initial_price),
-            calculate_short_liquidation_price(leverage_trader, initial_price),
+            calculate_long_bankruptcy_price(leverage_coordinator, initial_price),
+            calculate_short_bankruptcy_price(leverage_trader, initial_price),
         ),
         Direction::Short => (
-            calculate_short_liquidation_price(leverage_coordinator, initial_price),
-            calculate_long_liquidation_price(leverage_trader, initial_price),
+            calculate_short_bankruptcy_price(leverage_coordinator, initial_price),
+            calculate_long_bankruptcy_price(leverage_trader, initial_price),
         ),
     };
     (coordinator_liquidation_price, trader_liquidation_price)
 }
 
-pub fn create_rounding_intervals(
-    total_margin: u64,
-    long_liquidation_price: u64,
-    short_liquidation_price: u64,
-) -> RoundingIntervals {
-    let liquidation_diff = short_liquidation_price
-        .checked_sub(long_liquidation_price)
-        .expect("short liquidation to be higher than long liquidation");
-    let low_price = long_liquidation_price + liquidation_diff / 10;
-    let high_price = short_liquidation_price - liquidation_diff / 10;
-
-    let mut intervals = vec![
-        RoundingInterval {
-            begin_interval: 0,
-            // No rounding.
-            rounding_mod: 1,
-        },
-        // HACK: We decrease the rounding here to prevent `rust-dlc` from rounding under the long
-        // liquidation price _payout_.
-        RoundingInterval {
-            begin_interval: long_liquidation_price,
-            rounding_mod: (total_margin as f32 * ROUNDING_PERCENT * 0.1) as u64,
-        },
-        RoundingInterval {
-            begin_interval: low_price,
-            rounding_mod: (total_margin as f32 * ROUNDING_PERCENT) as u64,
-        },
-    ];
-
-    if short_liquidation_price < BTCUSD_MAX_PRICE {
-        intervals.push(
-            // HACK: We decrease the rounding here to prevent `rust-dlc` from rounding over the
-            // short liquidation price _payout_.
-            RoundingInterval {
-                begin_interval: high_price,
-                rounding_mod: (total_margin as f32 * ROUNDING_PERCENT * 0.1) as u64,
-            },
-        );
-        intervals.push(RoundingInterval {
-            begin_interval: short_liquidation_price,
-            // No rounding.
-            rounding_mod: 1,
-        })
-    }
-
-    RoundingIntervals { intervals }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commons::order_matching_fee_taker;
+    use proptest::prelude::*;
     use rust_decimal_macros::dec;
     use trade::cfd::calculate_margin;
 
@@ -255,9 +194,8 @@ mod tests {
 
         let coordinator_direction = Direction::Long;
 
-        let coordinator_collateral_reserve =
-            order_matching_fee_taker(quantity, initial_price).to_sat();
-        let trader_collateral_reserve = order_matching_fee_taker(quantity, initial_price).to_sat();
+        let coordinator_collateral_reserve = Amount::from_sat(1000).to_sat();
+        let trader_collateral_reserve = Amount::from_sat(1000).to_sat();
 
         let total_collateral = coordinator_margin + trader_margin;
 
@@ -279,9 +217,11 @@ mod tests {
 
         let range_payouts = match descriptor {
             ContractDescriptor::Enum(_) => unreachable!(),
-            ContractDescriptor::Numerical(numerical) => {
-                numerical.get_range_payouts(total_collateral).unwrap()
-            }
+            ContractDescriptor::Numerical(numerical) => numerical
+                .get_range_payouts(
+                    total_collateral + coordinator_collateral_reserve + trader_collateral_reserve,
+                )
+                .unwrap(),
         };
 
         let max_price = 2usize.pow(20);
@@ -295,6 +235,153 @@ mod tests {
                 range_payout.start + range_payout.count,
                 max_price
             );
+        }
+    }
+
+    #[test]
+    /// We check that the generated payout function takes into account the provided collateral
+    /// reserves. A party's collateral reserve is their coins in the DLC channel that are not being
+    /// wagered. As such, we expect _any_ of their payouts to be _at least_ their collateral
+    /// reserve.
+    fn payout_function_respects_collateral_reserve() {
+        // Arrange
+
+        let initial_price = dec!(28_251);
+        let quantity = 500.0;
+        let leverage_offer = 2.0;
+        let margin_offer = calculate_margin(initial_price, quantity, leverage_offer);
+
+        let leverage_accept = 2.0;
+        let margin_accept = calculate_margin(initial_price, quantity, leverage_accept);
+
+        let direction_offer = Direction::Short;
+
+        let collateral_reserve_offer = 2_120_386;
+        let collateral_reserve_accept = 5_115_076;
+
+        let total_collateral =
+            margin_offer + margin_accept + collateral_reserve_offer + collateral_reserve_accept;
+
+        let symbol = ContractSymbol::BtcUsd;
+
+        // Act
+
+        let descriptor = build_contract_descriptor(
+            initial_price,
+            margin_offer,
+            margin_accept,
+            leverage_offer,
+            leverage_accept,
+            direction_offer,
+            collateral_reserve_offer,
+            collateral_reserve_accept,
+            quantity,
+            symbol,
+        )
+        .unwrap();
+
+        // Assert
+
+        // Extract the payouts from the generated `ContractDescriptor`.
+        let range_payouts = match descriptor {
+            ContractDescriptor::Enum(_) => unreachable!(),
+            ContractDescriptor::Numerical(numerical) => {
+                numerical.get_range_payouts(total_collateral).unwrap()
+            }
+        };
+
+        // The offer party gets liquidated when they get the minimum amount of sats as a payout.
+        let liquidation_payout_offer = range_payouts
+            .iter()
+            .min_by(|a, b| a.payout.offer.cmp(&b.payout.offer))
+            .unwrap()
+            .payout
+            .offer;
+
+        // The minimum amount the offer party can get as a payout is their collateral reserve.
+        assert_eq!(liquidation_payout_offer, collateral_reserve_offer);
+
+        // The accept party gets liquidated when they get the minimum amount of sats as a payout.
+        let liquidation_payout_accept = range_payouts
+            .iter()
+            .min_by(|a, b| a.payout.accept.cmp(&b.payout.accept))
+            .unwrap()
+            .payout
+            .accept;
+
+        // The minimum amount the accept party can get as a payout is their collateral reserve.
+        assert_eq!(liquidation_payout_accept, collateral_reserve_accept);
+    }
+
+    proptest! {
+        #[test]
+        fn payout_function_always_respects_reserves(
+            quantity in 1.0f32..10_000.0,
+            initial_price in 20_000u32..80_000,
+            leverage_coordinator in 1u32..5,
+            leverage_trader in 1u32..5,
+            is_coordinator_long in proptest::bool::ANY,
+            collateral_reserve_coordinator in 0u64..1_000_000,
+            collateral_reserve_trader in 0u64..1_000_000,
+        ) {
+            let initial_price = Decimal::from(initial_price);
+            let leverage_coordinator = leverage_coordinator as f32;
+            let leverage_trader = leverage_trader as f32;
+
+            let margin_coordinator = calculate_margin(initial_price, quantity, leverage_coordinator);
+            let margin_trader = calculate_margin(initial_price, quantity, leverage_trader);
+
+            let coordinator_direction = if is_coordinator_long {
+                Direction::Long
+            } else {
+                Direction::Short
+            };
+
+            let total_collateral = margin_coordinator
+                + margin_trader
+                + collateral_reserve_coordinator
+                + collateral_reserve_trader;
+
+            let symbol = ContractSymbol::BtcUsd;
+
+            let descriptor = build_contract_descriptor(
+                initial_price,
+                margin_coordinator,
+                margin_trader,
+                leverage_coordinator,
+                leverage_trader,
+                coordinator_direction,
+                collateral_reserve_coordinator,
+                collateral_reserve_trader,
+                quantity,
+                symbol,
+            )
+                .unwrap();
+
+            let range_payouts = match descriptor {
+                ContractDescriptor::Enum(_) => unreachable!(),
+                ContractDescriptor::Numerical(numerical) => numerical
+                    .get_range_payouts(total_collateral)
+                    .unwrap(),
+            };
+
+            let liquidation_payout_offer = range_payouts
+                .iter()
+                .min_by(|a, b| a.payout.offer.cmp(&b.payout.offer))
+                .unwrap()
+                .payout
+                .offer;
+
+            assert_eq!(liquidation_payout_offer, collateral_reserve_coordinator);
+
+            let liquidation_payout_accept = range_payouts
+                .iter()
+                .min_by(|a, b| a.payout.accept.cmp(&b.payout.accept))
+                .unwrap()
+                .payout
+                .accept;
+
+            assert_eq!(liquidation_payout_accept, collateral_reserve_trader);
         }
     }
 
@@ -335,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn build_contract_descriptor_dont_panic() {
+    fn build_contract_descriptor_does_not_panic() {
         let initial_price = dec!(36404.5);
         let quantity = 20.0;
         let leverage_coordinator = 2.0;

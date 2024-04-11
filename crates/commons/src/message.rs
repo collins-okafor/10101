@@ -2,6 +2,7 @@ use crate::order::Order;
 use crate::signature::Signature;
 use crate::trade::FilledWith;
 use crate::LiquidityOption;
+use crate::ReferralStatus;
 use anyhow::Result;
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::Address;
@@ -24,7 +25,7 @@ pub enum Message {
     DeleteOrder(Uuid),
     Update(Order),
     InvalidAuthentication(String),
-    Authenticated(LspConfig),
+    Authenticated(TenTenOneConfig),
     Match(FilledWith),
     AsyncMatch {
         order: Order,
@@ -65,11 +66,13 @@ impl From<anyhow::Error> for TradingError {
 }
 
 #[derive(Serialize, Clone, Deserialize, Debug)]
-pub struct LspConfig {
-    /// The fee rate to be used for the DLC contracts in sats/vbyte
-    pub contract_tx_fee_rate: u64,
+pub struct TenTenOneConfig {
     // The liquidity options for onboarding
     pub liquidity_options: Vec<LiquidityOption>,
+    pub min_quantity: u64,
+    pub maintenance_margin_rate: f32,
+    pub order_matching_fee_rate: f32,
+    pub referral_status: ReferralStatus,
 }
 
 #[derive(Serialize, Clone, Deserialize, Debug)]

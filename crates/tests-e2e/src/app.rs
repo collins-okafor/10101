@@ -25,6 +25,9 @@ impl AppHandle {
 pub async fn run_app(seed_phrase: Option<Vec<String>>) -> AppHandle {
     let app_dir = TempDir::new().unwrap();
     let seed_dir = TempDir::new().unwrap();
+
+    tracing::debug!(?app_dir, ?seed_dir, "Starting 10101 backend");
+
     let _app_handle = {
         let as_string = |dir: &TempDir| dir.path().to_str().unwrap().to_string();
 
@@ -64,6 +67,11 @@ pub async fn run_app(seed_phrase: Option<Vec<String>>) -> AppHandle {
 
     wait_until!(app.rx.init_msg() == Some("10101 is ready.".to_string()));
     wait_until!(app.rx.wallet_info().is_some()); // wait for initial wallet sync
+
+    block_in_place(move || {
+        api::register_beta("hello@10101.finance".to_string(), None).expect("to work")
+    });
+
     app
 }
 
@@ -104,8 +112,8 @@ pub fn get_dlc_channels() -> Vec<DlcChannel> {
     block_in_place(move || api::list_dlc_channels().unwrap())
 }
 
-pub fn submit_order(order: NewOrder) {
-    block_in_place(move || api::submit_order(order).unwrap());
+pub fn submit_order(order: NewOrder) -> String {
+    block_in_place(move || api::submit_order(order).unwrap())
 }
 
 pub fn submit_channel_opening_order(

@@ -30,6 +30,7 @@ pub enum OrderState {
 pub enum OrderReason {
     Manual,
     Expired,
+    Liquidated,
 }
 
 #[frb]
@@ -96,7 +97,9 @@ impl From<order::OrderType> for OrderType {
 impl From<order::Order> for Order {
     fn from(value: order::Order) -> Self {
         let execution_price = match value.state {
-            order::OrderState::Filled { execution_price } => Some(execution_price),
+            order::OrderState::Filled {
+                execution_price, ..
+            } => Some(execution_price),
             _ => None,
         };
 
@@ -117,20 +120,13 @@ impl From<order::Order> for Order {
     }
 }
 
-impl From<OrderReason> for order::OrderReason {
-    fn from(value: OrderReason) -> Self {
-        match value {
-            OrderReason::Manual => order::OrderReason::Manual,
-            OrderReason::Expired => order::OrderReason::Expired,
-        }
-    }
-}
-
 impl From<order::OrderReason> for OrderReason {
     fn from(value: order::OrderReason) -> Self {
         match value {
             order::OrderReason::Manual => OrderReason::Manual,
             order::OrderReason::Expired => OrderReason::Expired,
+            order::OrderReason::CoordinatorLiquidated => OrderReason::Liquidated,
+            order::OrderReason::TraderLiquidated => OrderReason::Liquidated,
         }
     }
 }

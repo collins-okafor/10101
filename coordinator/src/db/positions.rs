@@ -6,6 +6,8 @@ use anyhow::bail;
 use anyhow::ensure;
 use anyhow::Result;
 use bitcoin::secp256k1::PublicKey;
+use bitcoin::Amount;
+use bitcoin::SignedAmount;
 use diesel::prelude::*;
 use diesel::query_builder::QueryId;
 use diesel::result::QueryResult;
@@ -13,6 +15,8 @@ use diesel::AsExpression;
 use diesel::FromSqlRow;
 use dlc_manager::ContractId;
 use hex::FromHex;
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use std::any::TypeId;
 use time::OffsetDateTime;
 
@@ -38,6 +42,8 @@ pub struct Position {
     pub coordinator_leverage: f32,
     pub trader_margin: i64,
     pub stable: bool,
+    pub coordinator_liquidation_price: f32,
+    pub order_matching_fees: i64,
 }
 
 impl Position {
@@ -131,22 +137,27 @@ impl Position {
         Ok(positions)
     }
 
-    /// sets the status of the position in state `Proposed` to a new state
-    pub fn update_proposed_position(
+    /// Set the `position_state` column from to `updated`. This will only succeed if the column does
+    /// match one of the values contained in `original`.
+    pub fn update_position_state(
         conn: &mut PgConnection,
         trader_pubkey: String,
-        state: crate::position::models::PositionState,
+        original: Vec<crate::position::models::PositionState>,
+        updated: crate::position::models::PositionState,
     ) -> QueryResult<crate::position::models::Position> {
-        let state = PositionState::from(state);
+        if original.is_empty() {
+            // It is not really a `NotFound` error, but `diesel` does not make it easy to build
+            // other variants.
+            return QueryResult::Err(diesel::result::Error::NotFound);
+        }
+
+        let updated = PositionState::from(updated);
+
         let position: Position = diesel::update(positions::table)
             .filter(positions::trader_pubkey.eq(trader_pubkey.clone()))
-            .filter(
-                positions::position_state
-                    .eq(PositionState::Proposed)
-                    .or(positions::position_state.eq(PositionState::ResizeProposed)),
-            )
+            .filter(positions::position_state.eq_any(original.into_iter().map(PositionState::from)))
             .set((
-                positions::position_state.eq(state),
+                positions::position_state.eq(updated),
                 positions::update_timestamp.eq(OffsetDateTime::now_utc()),
             ))
             .get_result(conn)?;
@@ -181,103 +192,36 @@ impl Position {
     /// exactly 1)
     pub fn set_open_position_to_closing(
         conn: &mut PgConnection,
-        trader_pubkey: String,
-        closing_price: f32,
-    ) -> Result<()> {
-        let affected_rows = diesel::update(positions::table)
-            .filter(positions::trader_pubkey.eq(trader_pubkey.clone()))
+        trader: &PublicKey,
+        closing_price: Option<Decimal>,
+    ) -> QueryResult<usize> {
+        let closing_price = closing_price.map(|price| price.to_f32().expect("to fit into f32"));
+        diesel::update(positions::table)
+            .filter(positions::trader_pubkey.eq(trader.to_string()))
             .filter(positions::position_state.eq(PositionState::Open))
             .set((
                 positions::position_state.eq(PositionState::Closing),
-                positions::closing_price.eq(Some(closing_price)),
+                positions::closing_price.eq(closing_price),
                 positions::update_timestamp.eq(OffsetDateTime::now_utc()),
             ))
-            .execute(conn)?;
-
-        if affected_rows == 0 {
-            bail!("Could not update position to Closing for {trader_pubkey}")
-        }
-
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn set_open_position_to_resizing(
-        conn: &mut PgConnection,
-        trader_pubkey: String,
-    ) -> Result<()> {
-        let affected_rows = diesel::update(positions::table)
-            .filter(positions::trader_pubkey.eq(trader_pubkey.clone()))
-            .filter(positions::position_state.eq(PositionState::Open))
-            .set((
-                positions::position_state.eq(PositionState::Resizing),
-                positions::update_timestamp.eq(OffsetDateTime::now_utc()),
-            ))
-            .execute(conn)?;
-
-        if affected_rows == 0 {
-            bail!("Could not update position to Resizing for {trader_pubkey}")
-        }
-
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_resized_position(
-        conn: &mut PgConnection,
-        trader_pubkey: String,
-        quantity: f32,
-        direction: Direction,
-        coordinator_leverage: f32,
-        trader_leverage: f32,
-        coordinator_margin: i64,
-        trader_margin: i64,
-        average_entry_price: f32,
-        liquidation_price: f32,
-        expiry_timestamp: OffsetDateTime,
-        temporary_contract_id: ContractId,
-    ) -> Result<()> {
-        let affected_rows = diesel::update(positions::table)
-            .filter(positions::trader_pubkey.eq(trader_pubkey.clone()))
-            .filter(positions::position_state.eq(PositionState::Resizing))
-            .set((
-                positions::position_state.eq(PositionState::ResizeProposed),
-                positions::update_timestamp.eq(OffsetDateTime::now_utc()),
-                positions::quantity.eq(quantity),
-                positions::trader_direction.eq(direction),
-                positions::trader_leverage.eq(trader_leverage),
-                positions::coordinator_leverage.eq(coordinator_leverage),
-                positions::coordinator_margin.eq(coordinator_margin),
-                positions::trader_margin.eq(trader_margin),
-                positions::average_entry_price.eq(average_entry_price),
-                positions::trader_liquidation_price.eq(liquidation_price),
-                positions::expiry_timestamp.eq(expiry_timestamp),
-                positions::temporary_contract_id.eq(hex::encode(temporary_contract_id)),
-            ))
-            .execute(conn)?;
-
-        if affected_rows == 0 {
-            bail!("Could not update position to Resizing for {trader_pubkey}")
-        }
-
-        Ok(())
+            .execute(conn)
     }
 
     pub fn set_position_to_closed_with_pnl(
         conn: &mut PgConnection,
         id: i32,
         trader_realized_pnl_sat: i64,
-    ) -> QueryResult<crate::position::models::Position> {
-        let position: Position = diesel::update(positions::table)
+        closing_price: Decimal,
+    ) -> QueryResult<usize> {
+        diesel::update(positions::table)
             .filter(positions::id.eq(id))
             .set((
                 positions::position_state.eq(PositionState::Closed),
                 positions::trader_realized_pnl_sat.eq(Some(trader_realized_pnl_sat)),
                 positions::update_timestamp.eq(OffsetDateTime::now_utc()),
+                positions::closing_price.eq(closing_price.to_f32().expect("to fit into f32")),
             ))
-            .get_result(conn)?;
-
-        Ok(crate::position::models::Position::from(position))
+            .execute(conn)
     }
 
     pub fn set_position_to_closed(conn: &mut PgConnection, id: i32) -> Result<()> {
@@ -294,6 +238,51 @@ impl Position {
         }
 
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_position_to_resizing(
+        conn: &mut PgConnection,
+        trader_pubkey: PublicKey,
+        temporary_contract_id: ContractId,
+        quantity: Decimal,
+        trader_direction: trade::Direction,
+        trader_margin: Amount,
+        coordinator_margin: Amount,
+        average_entry_price: Decimal,
+        expiry: OffsetDateTime,
+        coordinator_liquidation_price: Decimal,
+        trader_liquidation_price: Decimal,
+        // Reducing or changing direction may generate PNL.
+        realized_pnl: Option<SignedAmount>,
+        order_matching_fee: Amount,
+    ) -> QueryResult<usize> {
+        let resize_trader_realized_pnl_sat = realized_pnl.unwrap_or_default().to_sat();
+
+        diesel::update(positions::table)
+            .filter(positions::trader_pubkey.eq(trader_pubkey.to_string()))
+            .filter(positions::position_state.eq(PositionState::Open))
+            .set((
+                positions::position_state.eq(PositionState::Resizing),
+                positions::temporary_contract_id.eq(hex::encode(temporary_contract_id)),
+                positions::quantity.eq(quantity.to_f32().expect("to fit")),
+                positions::trader_direction.eq(Direction::from(trader_direction)),
+                positions::average_entry_price.eq(average_entry_price.to_f32().expect("to fit")),
+                positions::trader_liquidation_price
+                    .eq(trader_liquidation_price.to_f32().expect("to fit")),
+                positions::coordinator_liquidation_price
+                    .eq(coordinator_liquidation_price.to_f32().expect("to fit")),
+                positions::coordinator_margin.eq(coordinator_margin.to_sat() as i64),
+                positions::expiry_timestamp.eq(expiry),
+                positions::trader_realized_pnl_sat
+                    .eq(positions::trader_realized_pnl_sat + resize_trader_realized_pnl_sat),
+                positions::trader_unrealized_pnl_sat.eq(0),
+                positions::trader_margin.eq(trader_margin.to_sat() as i64),
+                positions::update_timestamp.eq(OffsetDateTime::now_utc()),
+                positions::order_matching_fees
+                    .eq(positions::order_matching_fees + order_matching_fee.to_sat() as i64),
+            ))
+            .execute(conn)
     }
 
     pub fn set_position_to_open(
@@ -373,9 +362,6 @@ impl From<crate::position::models::PositionState> for PositionState {
             crate::position::models::PositionState::Closed { .. } => PositionState::Closed,
             crate::position::models::PositionState::Rollover => PositionState::Rollover,
             crate::position::models::PositionState::Resizing { .. } => PositionState::Resizing,
-            crate::position::models::PositionState::ResizeOpeningSubchannelProposed => {
-                PositionState::ResizeProposed
-            }
             crate::position::models::PositionState::Proposed => PositionState::Proposed,
             crate::position::models::PositionState::Failed => PositionState::Failed,
         }
@@ -392,6 +378,7 @@ impl From<Position> for crate::position::models::Position {
             trader_direction: trade::Direction::from(value.trader_direction),
             average_entry_price: value.average_entry_price,
             trader_liquidation_price: value.trader_liquidation_price,
+            coordinator_liquidation_price: value.coordinator_liquidation_price,
             position_state: crate::position::models::PositionState::from((
                 value.position_state,
                 value.trader_realized_pnl_sat,
@@ -410,6 +397,7 @@ impl From<Position> for crate::position::models::Position {
             trader_margin: value.trader_margin,
             stable: value.stable,
             trader_realized_pnl_sat: value.trader_realized_pnl_sat,
+            order_matching_fees: Amount::from_sat(value.order_matching_fees as u64),
         }
     }
 }
@@ -423,6 +411,7 @@ struct NewPosition {
     pub trader_direction: Direction,
     pub average_entry_price: f32,
     pub trader_liquidation_price: f32,
+    pub coordinator_liquidation_price: f32,
     pub position_state: PositionState,
     pub coordinator_margin: i64,
     pub expiry_timestamp: OffsetDateTime,
@@ -431,6 +420,7 @@ struct NewPosition {
     pub coordinator_leverage: f32,
     pub trader_margin: i64,
     pub stable: bool,
+    pub order_matching_fees: i64,
 }
 
 impl From<crate::position::models::NewPosition> for NewPosition {
@@ -441,7 +431,14 @@ impl From<crate::position::models::NewPosition> for NewPosition {
             quantity: value.quantity,
             trader_direction: Direction::from(value.trader_direction),
             average_entry_price: value.average_entry_price,
-            trader_liquidation_price: value.trader_liquidation_price,
+            trader_liquidation_price: value
+                .trader_liquidation_price
+                .to_f32()
+                .expect("to fit into f32"),
+            coordinator_liquidation_price: value
+                .coordinator_liquidation_price
+                .to_f32()
+                .expect("to fit into f32"),
             position_state: PositionState::Proposed,
             coordinator_margin: value.coordinator_margin,
             expiry_timestamp: value.expiry_timestamp,
@@ -450,6 +447,7 @@ impl From<crate::position::models::NewPosition> for NewPosition {
             coordinator_leverage: value.coordinator_leverage,
             trader_margin: value.trader_margin,
             stable: value.stable,
+            order_matching_fees: value.order_matching_fees.to_sat() as i64,
         }
     }
 }
@@ -464,7 +462,6 @@ pub enum PositionState {
     Closed,
     Failed,
     Resizing,
-    ResizeProposed,
 }
 
 impl QueryId for PositionStateType {
@@ -496,9 +493,6 @@ impl From<(PositionState, Option<i64>, Option<f32>)> for crate::position::models
             PositionState::Resizing => crate::position::models::PositionState::Resizing,
             PositionState::Proposed => crate::position::models::PositionState::Proposed,
             PositionState::Failed => crate::position::models::PositionState::Failed,
-            PositionState::ResizeProposed => {
-                crate::position::models::PositionState::ResizeOpeningSubchannelProposed
-            }
         }
     }
 }

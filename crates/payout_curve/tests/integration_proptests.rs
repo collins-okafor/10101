@@ -11,18 +11,16 @@ use dlc_manager::payout_curve::RoundingIntervals;
 use payout_curve::build_inverse_payout_function;
 use payout_curve::PartyParams;
 use payout_curve::PriceParams;
-use payout_curve::ROUNDING_PERCENT;
 use proptest::prelude::*;
 use rust_decimal::prelude::FromPrimitive;
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::fs::File;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-use trade::cfd::calculate_long_liquidation_price;
+use trade::cfd::calculate_long_bankruptcy_price;
 use trade::cfd::calculate_margin;
-use trade::cfd::calculate_short_liquidation_price;
+use trade::cfd::calculate_short_bankruptcy_price;
 use trade::Direction;
 
 /// set this to true to export test data to csv files
@@ -47,11 +45,11 @@ fn calculating_payout_curve_doesnt_crash_1() {
         Direction::Short => (leverage_trader, leverage_coordinator),
     };
 
-    let long_liquidation_price = calculate_long_liquidation_price(
+    let long_liquidation_price = calculate_long_bankruptcy_price(
         Decimal::from_f32(leverage_long).expect("to be able to parse f32"),
         initial_price,
     );
-    let short_liquidation_price = calculate_short_liquidation_price(
+    let short_liquidation_price = calculate_short_bankruptcy_price(
         Decimal::from_f32(leverage_short).expect("to be able to parse f32"),
         initial_price,
     );
@@ -89,11 +87,11 @@ fn calculating_payout_curve_doesnt_crash_2() {
         Direction::Short => (leverage_trader, leverage_coordinator),
     };
 
-    let long_liquidation_price = calculate_long_liquidation_price(
+    let long_liquidation_price = calculate_long_bankruptcy_price(
         Decimal::from_f32(leverage_long).expect("to be able to parse f32"),
         initial_price,
     );
-    let short_liquidation_price = calculate_short_liquidation_price(
+    let short_liquidation_price = calculate_short_bankruptcy_price(
         Decimal::from_f32(leverage_short).expect("to be able to parse f32"),
         initial_price,
     );
@@ -131,11 +129,11 @@ fn calculating_payout_curve_doesnt_crash_3() {
         Direction::Short => (leverage_trader, leverage_coordinator),
     };
 
-    let long_liquidation_price = calculate_long_liquidation_price(
+    let long_liquidation_price = calculate_long_bankruptcy_price(
         Decimal::from_f32(leverage_long).expect("to be able to parse f32"),
         initial_price,
     );
-    let short_liquidation_price = calculate_short_liquidation_price(
+    let short_liquidation_price = calculate_short_bankruptcy_price(
         Decimal::from_f32(leverage_short).expect("to be able to parse f32"),
         initial_price,
     );
@@ -182,11 +180,11 @@ proptest! {
             Direction::Short => (leverage_trader, leverage_coordinator),
         };
 
-        let long_liquidation_price = calculate_long_liquidation_price(
+        let long_liquidation_price = calculate_long_bankruptcy_price(
             Decimal::from_f32(leverage_long).expect("to be able to parse f32"),
             initial_price,
         );
-        let short_liquidation_price = calculate_short_liquidation_price(
+        let short_liquidation_price = calculate_short_bankruptcy_price(
             Decimal::from_f32(leverage_short).expect("to be able to parse f32"),
             initial_price,
         );
@@ -300,24 +298,13 @@ fn computed_payout_curve(
 
     let total_collateral =
         party_params_coordinator.total_collateral() + party_params_trader.total_collateral();
-    let total_margin = party_params_coordinator.margin() + party_params_trader.margin();
     let _ = payout_function.to_range_payouts(
         total_collateral,
         &RoundingIntervals {
-            intervals: vec![
-                RoundingInterval {
-                    begin_interval: 0,
-                    rounding_mod: 1,
-                },
-                RoundingInterval {
-                    begin_interval: long_liquidation_price.to_u64().unwrap(),
-                    rounding_mod: (total_margin as f32 * ROUNDING_PERCENT) as u64,
-                },
-                RoundingInterval {
-                    begin_interval: short_liquidation_price.to_u64().unwrap(),
-                    rounding_mod: 1,
-                },
-            ],
+            intervals: vec![RoundingInterval {
+                begin_interval: 0,
+                rounding_mod: 1,
+            }],
         },
     )?;
 

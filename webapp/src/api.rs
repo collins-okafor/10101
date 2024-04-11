@@ -1,4 +1,5 @@
-use crate::subscribers::AppSubscribers;
+use crate::AppState;
+use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use axum::extract::Path;
@@ -12,8 +13,7 @@ use axum::routing::post;
 use axum::Json;
 use axum::Router;
 use bitcoin::Amount;
-use commons::order_matching_fee_taker;
-use commons::taker_fee;
+use commons::order_matching_fee;
 use commons::ChannelOpeningParams;
 use commons::Price;
 use native::api::ContractSymbol;
@@ -40,7 +40,7 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-pub fn router(subscribers: Arc<AppSubscribers>) -> Router {
+pub fn router(app_state: AppState) -> Router {
     Router::new()
         .route("/api/balance", get(get_balance))
         .route("/api/newaddress", get(get_unused_address))
@@ -54,7 +54,7 @@ pub fn router(subscribers: Arc<AppSubscribers>) -> Router {
         .route("/api/seed", get(get_seed_phrase))
         .route("/api/channels", get(get_channels).delete(close_channel))
         .route("/api/tradeconstraints", get(get_trade_constraints))
-        .with_state(subscribers)
+        .with_state(Arc::new(app_state))
 }
 
 pub struct AppError(anyhow::Error);
@@ -106,8 +106,9 @@ pub struct Balance {
 }
 
 pub async fn get_balance(
-    State(subscribers): State<Arc<AppSubscribers>>,
+    State(state): State<Arc<AppState>>,
 ) -> Result<Json<Option<Balance>>, AppError> {
+    let subscribers = &state.subscribers;
     let balance = subscribers.wallet_info().map(|wallet_info| Balance {
         on_chain: wallet_info.balances.on_chain,
         off_chain: wallet_info.balances.off_chain,
@@ -127,8 +128,9 @@ pub struct OnChainPayment {
 }
 
 pub async fn get_onchain_payment_history(
-    State(subscribers): State<Arc<AppSubscribers>>,
+    State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<OnChainPayment>>, AppError> {
+    let subscribers = &state.subscribers;
     let history = match subscribers.wallet_info() {
         Some(wallet_info) => wallet_info
             .history
@@ -162,11 +164,23 @@ pub struct Payment {
     fee: u64,
 }
 
-pub async fn send_payment(params: Json<Payment>) -> Result<(), AppError> {
+pub async fn send_payment(
+    State(state): State<Arc<AppState>>,
+    Json(params): Json<Payment>,
+) -> Result<(), AppError> {
+    if !state.withdrawal_addresses.contains(&params.address)
+        && !ln_dlc::is_address_mine(&params.address)?
+        && state.whitelist_withdrawal_addresses
+    {
+        // if whitelisting is configured, the address is not whitelisted and not our own address we
+        // prevent the withdrawal.
+        return Err(anyhow!("Withdrawal address is not whitelisted!").into());
+    }
+
     ln_dlc::send_payment(
-        params.0.amount,
-        params.0.address,
-        Fee::FeeRate { sats: params.0.fee },
+        params.amount,
+        params.address,
+        Fee::FeeRate { sats: params.fee },
     )
     .await?;
 
@@ -290,6 +304,9 @@ impl From<(native::trade::position::Position, Option<Price>)> for Position {
                     Direction::Short => price.ask,
                 };
 
+                // FIXME: A from implementation should not contain this kind of logic.
+                let fee_rate = ln_dlc::get_order_matching_fee_rate();
+
                 (
                     calculate_pnl(
                         position.average_entry_price,
@@ -300,7 +317,7 @@ impl From<(native::trade::position::Position, Option<Price>)> for Position {
                     )
                     .ok(),
                     price
-                        .map(|price| Some(order_matching_fee_taker(position.quantity, price)))
+                        .map(|price| Some(order_matching_fee(position.quantity, price, fee_rate)))
                         .and_then(|price| price),
                 )
             }
@@ -332,17 +349,24 @@ impl From<(native::trade::position::Position, Option<Price>)> for Position {
 }
 
 pub async fn get_positions(
-    State(subscribers): State<Arc<AppSubscribers>>,
+    State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<Position>>, AppError> {
-    let orderbook_info = subscribers.orderbook_info();
+    let subscribers = &state.subscribers;
+    let ask_price = subscribers.ask_price();
+    let bid_price = subscribers.ask_price();
 
     let positions = native::trade::position::handler::get_positions()?
         .into_iter()
         .map(|position| {
-            let quotes = orderbook_info
-                .clone()
-                .map(|prices| prices.get(&position.contract_symbol).cloned())
-                .and_then(|inner| inner);
+            let quotes = if let (Some(ask), Some(bid)) = (ask_price, bid_price) {
+                Some(Price {
+                    bid: Some(bid),
+                    ask: Some(ask),
+                })
+            } else {
+                None
+            };
+            // TODO: we should clean this annoying into up sometimes
             (position, quotes).into()
         })
         .collect::<Vec<Position>>();
@@ -437,7 +461,10 @@ impl From<&native::trade::order::Order> for Order {
 
         // Note: we might overwrite a limit price here but this is not an issue because if a limit
         // order has been filled the limit price will be filled price and vice versa
-        if let native::trade::order::OrderState::Filled { execution_price } = value.state {
+        if let native::trade::order::OrderState::Filled {
+            execution_price, ..
+        } = value.state
+        {
             price.replace(execution_price);
         }
 
@@ -482,18 +509,23 @@ pub struct BestQuote {
 }
 
 pub async fn get_best_quote(
-    State(subscribers): State<Arc<AppSubscribers>>,
-    Path(contract_symbol): Path<ContractSymbol>,
+    State(state): State<Arc<AppState>>,
+    // todo: once we support multiple pairs we should use this
+    Path(_contract_symbol): Path<ContractSymbol>,
 ) -> Result<Json<Option<BestQuote>>, AppError> {
-    let quotes = subscribers
-        .orderbook_info()
-        .map(|prices| prices.get(&contract_symbol).cloned())
-        .and_then(|inner| inner);
+    let subscribers = &state.subscribers;
+    let ask_price = subscribers.ask_price();
+    let bid_price = subscribers.bid_price();
 
-    Ok(Json(quotes.map(|quote| BestQuote {
-        price: quote,
-        fee: taker_fee(),
-    })))
+    let quotes = BestQuote {
+        price: Price {
+            bid: bid_price,
+            ask: ask_price,
+        },
+        fee: ln_dlc::get_order_matching_fee_rate(),
+    };
+
+    Ok(Json(Some(quotes)))
 }
 
 #[derive(Serialize, Default)]
